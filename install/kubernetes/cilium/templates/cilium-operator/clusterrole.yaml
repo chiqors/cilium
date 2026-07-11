@@ -278,6 +278,7 @@ rules:
   - ciliuml2announcementpolicies.cilium.io
   - ciliumpodippools.cilium.io
   - ciliumgatewayclassconfigs.cilium.io
+  - ciliumgatewayauthpolicies.cilium.io
 {{- if and .Values.clustermesh.mcsapi.enabled .Values.clustermesh.mcsapi.installCRDs }}
   - serviceimports.multicluster.x-k8s.io
   - serviceexports.multicluster.x-k8s.io
@@ -397,6 +398,9 @@ rules:
   - cilium.io
   resources:
   - ciliumgatewayclassconfigs
+{{- if .Values.gatewayAPI.authPolicy.enabled }}
+  - ciliumgatewayauthpolicies
+{{- end }}
   verbs:
   - get
   - list
@@ -405,6 +409,9 @@ rules:
   - cilium.io
   resources:
   - ciliumgatewayclassconfigs/status
+{{- if .Values.gatewayAPI.authPolicy.enabled }}
+  - ciliumgatewayauthpolicies/status
+{{- end }}
   verbs:
   - update
   - patch
