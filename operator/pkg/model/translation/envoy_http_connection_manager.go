@@ -635,11 +635,11 @@ func oidcFilterName(policy model.GatewayAuthPolicy) string {
 }
 
 func oidcCallbackPath(policy model.GatewayAuthPolicy) string {
-	return fmt.Sprintf("/cilium-gateway-auth/oidc/%s/%s/callback", policy.Source.Namespace, policy.Source.Name)
+	return fmt.Sprintf("/.cilium-gateway-auth/oidc/%s/%s/callback", policy.Source.Namespace, policy.Source.Name)
 }
 
 func oidcLogoutPath(policy model.GatewayAuthPolicy) string {
-	return fmt.Sprintf("/cilium-gateway-auth/oidc/%s/%s/logout", policy.Source.Namespace, policy.Source.Name)
+	return fmt.Sprintf("/.cilium-gateway-auth/oidc/%s/%s/logout", policy.Source.Namespace, policy.Source.Name)
 }
 
 func (i *cecTranslator) buildOIDCHTTPFilter(policy model.GatewayAuthPolicy) *httpConnectionManagerv3.HttpFilter {
