@@ -176,7 +176,7 @@ func desiredSyncSecrets(secretsNamespace string, original *corev1.Secret) []*cor
 		desiredSyncSecret(secretsNamespace, original, gatewayhelpers.SyncedSecretName(original.Namespace, original.Name)),
 	}
 
-	if len(original.Data) <= 1 {
+	if original.Type != corev1.SecretTypeOpaque || len(original.Data) <= 1 {
 		return desired
 	}
 
