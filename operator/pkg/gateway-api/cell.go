@@ -49,6 +49,7 @@ var Cell = cell.Module(
 
 	cell.Config(gatewayApiConfig{
 		EnableGatewayAPISecretsSync:            true,
+		EnableGatewayAPIAuthPolicy:             false,
 		EnableGatewayAPIProxyProtocol:          false,
 		EnableGatewayAPIAppProtocol:            false,
 		EnableGatewayAPIAlpn:                   false,
@@ -188,6 +189,7 @@ func discoverCRDsWithRetry(ctx context.Context, client k8sClient.Clientset, logg
 
 type gatewayApiConfig struct {
 	EnableGatewayAPISecretsSync            bool
+	EnableGatewayAPIAuthPolicy             bool
 	EnableGatewayAPIProxyProtocol          bool
 	EnableGatewayAPIAppProtocol            bool
 	EnableGatewayAPIAlpn                   bool
@@ -202,6 +204,7 @@ type gatewayApiConfig struct {
 
 func (r gatewayApiConfig) Flags(flags *pflag.FlagSet) {
 	flags.Bool("enable-gateway-api-secrets-sync", r.EnableGatewayAPISecretsSync, "Enables fan-in TLS secrets sync from multiple namespaces to singular namespace (specified by gateway-api-secrets-namespace flag)")
+	flags.Bool("enable-gateway-api-auth-policy", r.EnableGatewayAPIAuthPolicy, "Enables the alpha CiliumGatewayAuthPolicy Gateway API policy surface")
 	flags.Bool("enable-gateway-api-proxy-protocol", r.EnableGatewayAPIProxyProtocol, "Enable proxy protocol for all GatewayAPI listeners. Note that _only_ Proxy protocol traffic will be accepted once this is enabled.")
 	flags.Bool("enable-gateway-api-app-protocol", r.EnableGatewayAPIAppProtocol, "Enables Backend Protocol selection (GEP-1911) for Gateway API via appProtocol")
 	flags.Bool("enable-gateway-api-alpn", r.EnableGatewayAPIAlpn, "Enables exposing ALPN with HTTP2 and HTTP/1.1 support for Gateway API")
@@ -290,6 +293,7 @@ func initGatewayAPIController(params gatewayAPIParams) error {
 		gatewayAPITranslator,
 		params.Logger,
 		defaultControllerName,
+		params.GatewayApiConfig.EnableGatewayAPIAuthPolicy,
 		installedOptionalKinds,
 	); err != nil {
 		return fmt.Errorf("failed to create gateway controller: %w", err)
@@ -322,19 +326,33 @@ func registerSecretSync(params secretSyncParams) secretsync.SecretSyncRegistrati
 	}
 
 	handler := NewSecretSyncHandler(params.CtrlRuntimeManager.GetClient(), params.Logger, defaultControllerName)
+	var additionalSecretWatches []secretsync.AdditionalWatch
+	var additionalConfigMapWatches []secretsync.AdditionalWatch
+	if params.GatewayApiConfig.EnableGatewayAPIAuthPolicy {
+		additionalSecretWatches = append(additionalSecretWatches, secretsync.AdditionalWatch{
+			RefObject:            &v2alpha1.CiliumGatewayAuthPolicy{},
+			RefObjectEnqueueFunc: handler.EnqueueGatewayAuthPolicySecrets(),
+		})
+		additionalConfigMapWatches = append(additionalConfigMapWatches, secretsync.AdditionalWatch{
+			RefObject:            &v2alpha1.CiliumGatewayAuthPolicy{},
+			RefObjectEnqueueFunc: handler.EnqueueGatewayAuthPolicyConfigMaps(),
+		})
+	}
 
 	return secretsync.SecretSyncRegistrationOut{
 		SecretSyncRegistration: &secretsync.SecretSyncRegistration{
 			RefObject:            &gatewayv1.Gateway{},
 			RefObjectEnqueueFunc: handler.EnqueueTLSSecrets(),
-			RefObjectCheckFunc:   handler.IsReferencedByGateway,
+			RefObjectCheckFunc:   handler.IsReferencedByGatewayOrAuthPolicy,
 			SecretsNamespace:     params.GatewayApiConfig.GatewayAPISecretsNamespace,
+			AdditionalWatches:    additionalSecretWatches,
 		},
 		ConfigMapSyncRegistration: &secretsync.ConfigMapSyncRegistration{
 			RefObject:            &gatewayv1.BackendTLSPolicy{},
 			RefObjectEnqueueFunc: handler.EnqueueBackendTLSPolicyConfigMaps(),
-			RefObjectCheckFunc:   handler.ConfigMapIsReferencedInGateway,
+			RefObjectCheckFunc:   handler.ConfigMapIsReferencedInGatewayOrAuthPolicy,
 			SecretsNamespace:     params.GatewayApiConfig.GatewayAPISecretsNamespace,
+			AdditionalWatches:    additionalConfigMapWatches,
 		},
 	}
 }
@@ -430,12 +448,12 @@ func checkCRDs(ctx context.Context, clientset k8sClient.Clientset, logger *slog.
 
 // registerReconcilers registers Gateway API reconcilers to the controller-runtime library manager.
 // optionalKinds are previously autodetected based on what CRDs are present in the cluster.
-func registerReconcilers(mgr ctrlRuntime.Manager, translator translation.Translator, logger *slog.Logger, controllerName string, installedOptionalCRDs []schema.GroupVersionKind) error {
+func registerReconcilers(mgr ctrlRuntime.Manager, translator translation.Translator, logger *slog.Logger, controllerName string, enableGatewayAPIAuthPolicy bool, installedOptionalCRDs []schema.GroupVersionKind) error {
 	requiredReconcilers := []interface {
 		SetupWithManager(mgr ctrlRuntime.Manager) error
 	}{
 		newGatewayClassReconciler(mgr, logger, controllerName),
-		newGatewayReconciler(mgr, translator, logger, controllerName),
+		newGatewayReconciler(mgr, translator, logger, controllerName, enableGatewayAPIAuthPolicy),
 		newGammaReconciler(mgr, translator, logger, controllerName),
 		newGatewayClassConfigReconciler(mgr, logger),
 		newEndpointSliceReconciler(mgr, logger),

@@ -6,8 +6,15 @@ package translation
 import (
 	"testing"
 
+	envoy_config_rbac_v3 "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
+	envoy_config_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	basicauthv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/basic_auth/v3"
 	httpCORSv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
 	extauthzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
+	jwtauthnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
+	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
+	oauth2v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/oauth2/v3"
+	rbacv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
 	httpConnectionManagerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -129,6 +136,215 @@ func Test_getHTTPConnectionManagerHttpFilters(t *testing.T) {
 		require.Equal(t, "envoy.filters.http.cors", res[2].Name)
 		require.Equal(t, "envoy.filters.http.router", res[3].Name)
 
+	})
+
+	t.Run("basic auth filters are inserted in authentication stage", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{
+				Routes: []model.HTTPRoute{{
+					GatewayAuthPolicy: "default/basic",
+				}},
+			}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{{
+					Source:    model.FullyQualifiedResource{Name: "basic", Namespace: "default"},
+					BasicAuth: &model.GatewayBasicAuth{UsernameHeader: "x-auth-user"},
+				}},
+			},
+		}
+		i := &cecTranslator{}
+		res := i.getHTTPConnectionManagerHttpFilters(m)
+
+		require.Len(t, res, 4)
+		require.Equal(t, "envoy.filters.http.grpc_web", res[0].Name)
+		require.Equal(t, "envoy.filters.http.grpc_stats", res[1].Name)
+		require.Equal(t, basicAuthFilterName("username-header:x-auth-user"), res[2].Name)
+		require.Equal(t, "envoy.filters.http.router", res[3].Name)
+	})
+
+	t.Run("api key auth filter is inserted in authentication stage", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{
+				Routes: []model.HTTPRoute{{
+					GatewayAuthPolicy: "default/api-key",
+				}},
+			}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{{
+					Source: model.FullyQualifiedResource{Name: "api-key", Namespace: "default"},
+					APIKeyAuth: &model.GatewayAPIKeyAuth{
+						Sources:     []model.GatewayAPIKeySource{{Type: "Header", Name: "x-api-key"}},
+						Credentials: []model.GatewayAPIKeyCredential{{Secret: model.GatewayAuthSecretRef{Found: true, Value: []byte("secret")}}},
+					},
+				}},
+			},
+		}
+		i := &cecTranslator{}
+		res := i.getHTTPConnectionManagerHttpFilters(m)
+
+		require.Len(t, res, 4)
+		require.Equal(t, "envoy.filters.http.grpc_web", res[0].Name)
+		require.Equal(t, "envoy.filters.http.grpc_stats", res[1].Name)
+		require.Equal(t, APIKeyAuthFilterName, res[2].Name)
+		require.Equal(t, "envoy.filters.http.router", res[3].Name)
+
+		luaFilter := &luav3.Lua{}
+		require.NoError(t, proto.Unmarshal(res[2].GetTypedConfig().Value, luaFilter))
+		require.Contains(t, luaFilter.GetDefaultSourceCode().GetInlineString(), "envoy_on_request")
+	})
+
+	t.Run("jwt auth filter is inserted in authentication stage", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{
+				Routes: []model.HTTPRoute{{
+					GatewayAuthPolicy: "default/jwt",
+				}},
+			}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{{
+					Source: model.FullyQualifiedResource{Name: "jwt", Namespace: "default"},
+					JWT: &model.GatewayJWTAuth{
+						Issuer:    "https://issuer.example.com",
+						Audiences: []string{"aud-a"},
+						LocalJWKS: &model.GatewayLocalJWKS{
+							ConfigMap: &model.GatewayAuthConfigMapRef{Found: true, Value: []byte(`{"keys":[]}`)},
+						},
+						ClaimToHeaders: []model.GatewayClaimToHeader{{Claim: "sub", Header: "x-jwt-sub"}},
+					},
+				}},
+			},
+		}
+		i := &cecTranslator{}
+		res := i.getHTTPConnectionManagerHttpFilters(m)
+
+		require.Len(t, res, 4)
+		require.Equal(t, "envoy.filters.http.grpc_web", res[0].Name)
+		require.Equal(t, "envoy.filters.http.grpc_stats", res[1].Name)
+		require.Equal(t, JWTAuthFilterName, res[2].Name)
+		require.Equal(t, "envoy.filters.http.router", res[3].Name)
+
+		jwtFilter := &jwtauthnv3.JwtAuthentication{}
+		require.NoError(t, proto.Unmarshal(res[2].GetTypedConfig().Value, jwtFilter))
+		require.Contains(t, jwtFilter.GetProviders(), "default/jwt")
+		require.Contains(t, jwtFilter.GetRequirementMap(), "default/jwt")
+		require.Equal(t, "https://issuer.example.com", jwtFilter.GetProviders()["default/jwt"].GetIssuer())
+		require.Equal(t, []string{"aud-a"}, jwtFilter.GetProviders()["default/jwt"].GetAudiences())
+		require.Equal(t, `{"keys":[]}`, jwtFilter.GetProviders()["default/jwt"].GetLocalJwks().GetInlineString())
+		require.Equal(t, "x-jwt-sub", jwtFilter.GetProviders()["default/jwt"].GetClaimToHeaders()[0].GetHeaderName())
+		require.Equal(t, "default/jwt", jwtFilter.GetProviders()["default/jwt"].GetPayloadInMetadata())
+	})
+
+	t.Run("oidc auth filter is inserted in authentication stage", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{
+				Routes: []model.HTTPRoute{{GatewayAuthPolicy: "default/oidc"}},
+			}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{{
+					Source: model.FullyQualifiedResource{Name: "oidc", Namespace: "default"},
+					OIDC: &model.GatewayOIDCAuth{
+						Issuer:       "https://issuer.example.com",
+						ClientID:     "client-id",
+						ClientSecret: model.GatewayAuthSecretRef{Name: "client", Found: true},
+						CookieSecret: model.GatewayAuthSecretRef{Name: "cookie", Found: true},
+						Endpoints: &model.GatewayOIDCEndpoints{
+							Authorization: "https://issuer.example.com/authorize",
+							Token:         "https://issuer.example.com/token",
+						},
+					},
+				}},
+			},
+		}
+		i := &cecTranslator{Config: Config{SecretsNamespace: "cilium-secrets"}}
+		res := i.getHTTPConnectionManagerHttpFilters(m)
+
+		require.Len(t, res, 4)
+		require.Equal(t, oidcFilterName(m.GatewayAuth.Policies[0]), res[2].Name)
+
+		oauth2Filter := &oauth2v3.OAuth2{}
+		require.NoError(t, proto.Unmarshal(res[2].GetTypedConfig().Value, oauth2Filter))
+		require.Equal(t, "client-id", oauth2Filter.GetConfig().GetCredentials().GetClientId())
+		require.Equal(t, "cilium-secrets/default-client", oauth2Filter.GetConfig().GetCredentials().GetTokenSecret().GetName())
+		require.Equal(t, "https://issuer.example.com/token", oauth2Filter.GetConfig().GetTokenEndpoint().GetUri())
+	})
+}
+
+func Test_getHTTPFilterStages(t *testing.T) {
+	i := &cecTranslator{}
+
+	t.Run("native auth stages empty until provider translators land", func(t *testing.T) {
+		m := &model.Model{}
+		require.Nil(t, i.getHTTPRouteMutationFilters(m))
+		require.Nil(t, i.getHTTPAuthenticationFilters(m))
+	})
+
+	t.Run("authorization stage contains ext auth filters", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{
+				Routes: []model.HTTPRoute{
+					{
+						ExternalAuth: &model.HTTPExternalAuthFilter{
+							Backend:  model.Backend{Name: "grpc-authz", Namespace: "default", Port: &model.BackendPort{Port: 9000}},
+							Protocol: model.ExternalAuthProtocolGRPC,
+						},
+					},
+				},
+			}},
+		}
+
+		res := i.getHTTPAuthorizationFilters(m)
+		require.Len(t, res, 1)
+		require.Contains(t, res[0].Name, "envoy.filters.http.ext_authz")
+	})
+
+	t.Run("authorization stage inserts gateway rbac before ext auth filters", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{
+				Routes: []model.HTTPRoute{
+					{
+						GatewayAuthPolicy: "default/authz",
+						ExternalAuth: &model.HTTPExternalAuthFilter{
+							Backend:  model.Backend{Name: "grpc-authz", Namespace: "default", Port: &model.BackendPort{Port: 9000}},
+							Protocol: model.ExternalAuthProtocolGRPC,
+						},
+					},
+				},
+			}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{{
+					Source: model.FullyQualifiedResource{Name: "authz", Namespace: "default"},
+					Authorization: &model.GatewayAuthorization{
+						Rules: []model.GatewayAuthorizationRule{{Methods: []string{"GET"}}},
+					},
+				}},
+			},
+		}
+
+		res := i.getHTTPAuthorizationFilters(m)
+		require.Len(t, res, 2)
+		require.Equal(t, GatewayAuthorizationFilterName, res[0].Name)
+		require.Contains(t, res[1].Name, "envoy.filters.http.ext_authz")
+
+		rbacFilter := &rbacv3.RBAC{}
+		require.NoError(t, proto.Unmarshal(res[0].GetTypedConfig().Value, rbacFilter))
+		require.Nil(t, rbacFilter.GetRules())
+	})
+
+	t.Run("terminal stage contains cors before router", func(t *testing.T) {
+		m := &model.Model{HTTP: []model.HTTPListener{
+			{
+				Routes: []model.HTTPRoute{
+					{
+						CORS: &model.HTTPCORSFilter{AllowOrigins: []string{"*"}},
+					},
+				},
+			},
+		}}
+
+		res := i.getHTTPTerminalFilters(m)
+		require.Len(t, res, 2)
+		require.Equal(t, "envoy.filters.http.cors", res[0].Name)
+		require.Equal(t, "envoy.filters.http.router", res[1].Name)
 	})
 }
 
@@ -310,7 +526,7 @@ func Test_getTypedPerFilterConfig(t *testing.T) {
 	}
 
 	t.Run("route without auth disables all filters", func(t *testing.T) {
-		cfg := getTypedPerFilterConfig(nil, authFilters, model.HTTPRoute{})
+		cfg := getTypedPerFilterConfig(nil, nil, authFilters, model.HTTPRoute{})
 		require.Len(t, cfg, 2)
 		for _, v := range cfg {
 			perRoute := &extauthzv3.ExtAuthzPerRoute{}
@@ -324,7 +540,7 @@ func Test_getTypedPerFilterConfig(t *testing.T) {
 			Backend:  model.Backend{Name: "svc-a", Namespace: "ns", Port: &model.BackendPort{Port: 9000}},
 			Protocol: model.ExternalAuthProtocolGRPC,
 		}
-		cfg := getTypedPerFilterConfig(routeAuth, authFilters, model.HTTPRoute{})
+		cfg := getTypedPerFilterConfig(nil, routeAuth, authFilters, model.HTTPRoute{})
 		// Only svc-b should be disabled; svc-a has no entry (enabled by default)
 		require.Len(t, cfg, 1)
 		_, hasSvcA := cfg["envoy.filters.http.ext_authz/GRPC:ns:svc-a:9000"]
@@ -337,7 +553,7 @@ func Test_getTypedPerFilterConfig(t *testing.T) {
 	})
 
 	t.Run("route with CORS filter", func(t *testing.T) {
-		cfg := getTypedPerFilterConfig(nil, nil, model.HTTPRoute{
+		cfg := getTypedPerFilterConfig(nil, nil, nil, model.HTTPRoute{
 			CORS: &model.HTTPCORSFilter{MaxAge: 42},
 		})
 		require.Len(t, cfg, 1)
@@ -346,7 +562,307 @@ func Test_getTypedPerFilterConfig(t *testing.T) {
 	})
 
 	t.Run("no auth filters returns nil", func(t *testing.T) {
-		require.Nil(t, getTypedPerFilterConfig(nil, nil, model.HTTPRoute{}))
+		require.Nil(t, getTypedPerFilterConfig(nil, nil, nil, model.HTTPRoute{}))
+	})
+
+	t.Run("route with gateway basic auth enables its filter and disables others", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{
+				Routes: []model.HTTPRoute{
+					{GatewayAuthPolicy: "default/basic-a"},
+					{GatewayAuthPolicy: "default/basic-b"},
+				},
+			}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{
+					{
+						Source:    model.FullyQualifiedResource{Name: "basic-a", Namespace: "default"},
+						BasicAuth: &model.GatewayBasicAuth{Secret: model.GatewayAuthSecretRef{Found: true, Value: []byte("alice:$apr1$hash")}},
+					},
+					{
+						Source:    model.FullyQualifiedResource{Name: "basic-b", Namespace: "default"},
+						BasicAuth: &model.GatewayBasicAuth{Secret: model.GatewayAuthSecretRef{Found: true, Value: []byte("bob:$apr1$hash")}, UsernameHeader: "x-auth-user"},
+					},
+				},
+			},
+		}
+
+		cfg := getTypedPerFilterConfig(m, nil, nil, model.HTTPRoute{GatewayAuthPolicy: "default/basic-b"})
+		require.Len(t, cfg, 2)
+
+		disabled := &envoy_config_route_v3.FilterConfig{}
+		require.NoError(t, proto.Unmarshal(cfg[basicAuthFilterName("default")].Value, disabled))
+		require.True(t, disabled.GetDisabled())
+
+		perRoute := &basicauthv3.BasicAuthPerRoute{}
+		require.NoError(t, proto.Unmarshal(cfg[basicAuthFilterName("username-header:x-auth-user")].Value, perRoute))
+		require.Equal(t, "bob:$apr1$hash", perRoute.GetUsers().GetInlineString())
+	})
+
+	t.Run("route with gateway api key auth configures lua per-route context", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{
+				Routes: []model.HTTPRoute{
+					{GatewayAuthPolicy: "default/api-key"},
+				},
+			}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{
+					{
+						Source: model.FullyQualifiedResource{Name: "api-key", Namespace: "default"},
+						APIKeyAuth: &model.GatewayAPIKeyAuth{
+							Sources: []model.GatewayAPIKeySource{
+								{Type: "Header", Name: "x-api-key"},
+								{Type: "Query", Name: "api_key"},
+							},
+							Credentials: []model.GatewayAPIKeyCredential{
+								{Secret: model.GatewayAuthSecretRef{Found: true, Value: []byte("secret-a")}, Identity: "client-a"},
+							},
+							IdentityHeader:  "x-identity",
+							StripCredential: true,
+						},
+					},
+				},
+			},
+		}
+
+		cfg := getTypedPerFilterConfig(m, nil, nil, model.HTTPRoute{GatewayAuthPolicy: "default/api-key"})
+		require.Len(t, cfg, 1)
+
+		perRoute := &luav3.LuaPerRoute{}
+		require.NoError(t, proto.Unmarshal(cfg[APIKeyAuthFilterName].Value, perRoute))
+		require.False(t, perRoute.GetDisabled())
+		require.Equal(t, "x-identity", perRoute.GetFilterContext().GetFields()["identity_header"].GetStringValue())
+		require.True(t, perRoute.GetFilterContext().GetFields()["strip_credential"].GetBoolValue())
+	})
+
+	t.Run("route with gateway jwt auth configures per-route requirement", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{
+				Routes: []model.HTTPRoute{
+					{GatewayAuthPolicy: "default/jwt"},
+					{},
+				},
+			}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{
+					{
+						Source: model.FullyQualifiedResource{Name: "jwt", Namespace: "default"},
+						JWT: &model.GatewayJWTAuth{
+							Issuer:        "https://issuer.example.com",
+							RemoteJWKSURI: "https://issuer.example.com/.well-known/jwks.json",
+						},
+					},
+				},
+			},
+		}
+
+		cfg := getTypedPerFilterConfig(m, nil, nil, model.HTTPRoute{GatewayAuthPolicy: "default/jwt"})
+		require.Len(t, cfg, 1)
+		perRoute := &jwtauthnv3.PerRouteConfig{}
+		require.NoError(t, proto.Unmarshal(cfg[JWTAuthFilterName].Value, perRoute))
+		require.Equal(t, "default/jwt", perRoute.GetRequirementName())
+
+		disabledCfg := getTypedPerFilterConfig(m, nil, nil, model.HTTPRoute{})
+		require.Len(t, disabledCfg, 1)
+		disabled := &jwtauthnv3.PerRouteConfig{}
+		require.NoError(t, proto.Unmarshal(disabledCfg[JWTAuthFilterName].Value, disabled))
+		require.True(t, disabled.GetDisabled())
+	})
+
+	t.Run("route without selected oidc policy disables other oidc filters", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{Routes: []model.HTTPRoute{{GatewayAuthPolicy: "default/oidc-a"}, {}}}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{{
+					Source: model.FullyQualifiedResource{Name: "oidc-a", Namespace: "default"},
+					OIDC: &model.GatewayOIDCAuth{
+						ClientID:     "client-a",
+						ClientSecret: model.GatewayAuthSecretRef{Name: "client-a", Found: true},
+						CookieSecret: model.GatewayAuthSecretRef{Name: "cookie-a", Found: true},
+						Endpoints: &model.GatewayOIDCEndpoints{
+							Authorization: "https://issuer.example.com/authorize",
+							Token:         "https://issuer.example.com/token",
+						},
+					},
+				}},
+			},
+		}
+
+		cfg := getTypedPerFilterConfig(m, nil, nil, model.HTTPRoute{})
+		require.Len(t, cfg, 1)
+
+		perRoute := &oauth2v3.OAuth2{}
+		require.NoError(t, proto.Unmarshal(cfg[oidcFilterName(m.GatewayAuth.Policies[0])].Value, perRoute))
+		require.Nil(t, perRoute.GetConfig())
+	})
+
+	t.Run("route with gateway authorization configures per-route rbac", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{
+				Routes: []model.HTTPRoute{
+					{GatewayAuthPolicy: "default/jwt-authz"},
+					{},
+				},
+			}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{{
+					Source: model.FullyQualifiedResource{Name: "jwt-authz", Namespace: "default"},
+					JWT: &model.GatewayJWTAuth{
+						Issuer:        "https://issuer.example.com",
+						RemoteJWKSURI: "https://issuer.example.com/.well-known/jwks.json",
+					},
+					Authorization: &model.GatewayAuthorization{
+						Rules: []model.GatewayAuthorizationRule{{
+							Principals: []string{"alice"},
+							Claims: []model.GatewayMatchAttribute{{
+								Name:   "role",
+								Values: []string{"admin"},
+							}},
+							Headers: []model.GatewayMatchAttribute{{
+								Name:   "x-tenant",
+								Values: []string{"team-a"},
+							}},
+							Methods: []string{"GET", "POST"},
+							Paths:   []string{"/admin/*"},
+							Hosts:   []string{"api.example.com"},
+							CIDRs:   []string{"192.0.2.0/24"},
+						}},
+					},
+				}},
+			},
+		}
+
+		cfg := getTypedPerFilterConfig(m, nil, nil, model.HTTPRoute{GatewayAuthPolicy: "default/jwt-authz"})
+		require.Contains(t, cfg, GatewayAuthorizationFilterName)
+
+		perRoute := &rbacv3.RBACPerRoute{}
+		require.NoError(t, proto.Unmarshal(cfg[GatewayAuthorizationFilterName].Value, perRoute))
+		require.NotNil(t, perRoute.GetRbac())
+		require.Equal(t, envoy_config_rbac_v3.RBAC_ALLOW, perRoute.GetRbac().GetRules().GetAction())
+		require.Len(t, perRoute.GetRbac().GetRules().GetPolicies(), 1)
+
+		policy := perRoute.GetRbac().GetRules().GetPolicies()["rule-0"]
+		require.NotNil(t, policy)
+		require.Len(t, policy.GetPermissions(), 1)
+		require.Len(t, policy.GetPrincipals(), 1)
+		require.NotNil(t, policy.GetPermissions()[0].GetAndRules())
+		require.NotNil(t, policy.GetPrincipals()[0].GetAndIds())
+
+		claimPrincipal := policy.GetPrincipals()[0].GetAndIds().GetIds()[1]
+		require.Equal(t, JWTAuthFilterName, claimPrincipal.GetMetadata().GetFilter())
+		require.Equal(t, "default/jwt-authz", claimPrincipal.GetMetadata().GetPath()[0].GetKey())
+		require.Equal(t, "role", claimPrincipal.GetMetadata().GetPath()[1].GetKey())
+		require.Equal(t, "admin", claimPrincipal.GetMetadata().GetValue().GetStringMatch().GetExact())
+
+		cidrPrincipal := policy.GetPrincipals()[0].GetAndIds().GetIds()[2]
+		require.Equal(t, "192.0.2.0", cidrPrincipal.GetRemoteIp().GetAddressPrefix())
+		require.Equal(t, uint32(24), cidrPrincipal.GetRemoteIp().GetPrefixLen().GetValue())
+	})
+
+	t.Run("route without gateway authorization keeps rbac disabled", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{Routes: []model.HTTPRoute{{}, {GatewayAuthPolicy: "default/authz"}}}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{{
+					Source: model.FullyQualifiedResource{Name: "authz", Namespace: "default"},
+					Authorization: &model.GatewayAuthorization{
+						Rules: []model.GatewayAuthorizationRule{{Methods: []string{"GET"}}},
+					},
+				}},
+			},
+		}
+
+		cfg := getTypedPerFilterConfig(m, nil, nil, model.HTTPRoute{})
+		require.Contains(t, cfg, GatewayAuthorizationFilterName)
+
+		perRoute := &rbacv3.RBACPerRoute{}
+		require.NoError(t, proto.Unmarshal(cfg[GatewayAuthorizationFilterName].Value, perRoute))
+		require.Nil(t, perRoute.GetRbac())
+	})
+
+	t.Run("route with unresolved basic auth fails closed via rbac", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{Routes: []model.HTTPRoute{{GatewayAuthPolicy: "default/basic"}}}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{{
+					Source: model.FullyQualifiedResource{Name: "basic", Namespace: "default"},
+					BasicAuth: &model.GatewayBasicAuth{
+						Secret: model.GatewayAuthSecretRef{Name: "basic", Key: "auth", Found: false},
+					},
+				}},
+			},
+		}
+
+		cfg := getTypedPerFilterConfig(m, nil, nil, model.HTTPRoute{GatewayAuthPolicy: "default/basic"})
+		require.Contains(t, cfg, GatewayAuthorizationFilterName)
+
+		perRoute := &rbacv3.RBACPerRoute{}
+		require.NoError(t, proto.Unmarshal(cfg[GatewayAuthorizationFilterName].Value, perRoute))
+		require.NotNil(t, perRoute.GetRbac())
+		require.Empty(t, perRoute.GetRbac().GetRules().GetPolicies())
+	})
+
+	t.Run("route with malformed jwt provider fails closed via rbac", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{Routes: []model.HTTPRoute{{GatewayAuthPolicy: "default/jwt"}}}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{{
+					Source: model.FullyQualifiedResource{Name: "jwt", Namespace: "default"},
+					JWT: &model.GatewayJWTAuth{
+						Issuer:        "https://issuer.example.com",
+						RemoteJWKSURI: "ftp://issuer.example.com/jwks",
+					},
+				}},
+			},
+		}
+
+		cfg := getTypedPerFilterConfig(m, nil, nil, model.HTTPRoute{GatewayAuthPolicy: "default/jwt"})
+		require.Contains(t, cfg, GatewayAuthorizationFilterName)
+
+		perRoute := &rbacv3.RBACPerRoute{}
+		require.NoError(t, proto.Unmarshal(cfg[GatewayAuthorizationFilterName].Value, perRoute))
+		require.NotNil(t, perRoute.GetRbac())
+		require.Empty(t, perRoute.GetRbac().GetRules().GetPolicies())
+	})
+
+	t.Run("external auth route remains enabled when gateway auth policy exists elsewhere", func(t *testing.T) {
+		authFilters := []*model.HTTPExternalAuthFilter{
+			{Backend: model.Backend{Name: "svc-a", Namespace: "ns", Port: &model.BackendPort{Port: 9000}}, Protocol: model.ExternalAuthProtocolGRPC},
+			{Backend: model.Backend{Name: "svc-b", Namespace: "ns", Port: &model.BackendPort{Port: 8080}}, Protocol: model.ExternalAuthProtocolHTTP},
+		}
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{
+				Routes: []model.HTTPRoute{
+					{
+						ExternalAuth: authFilters[0],
+					},
+					{
+						GatewayAuthPolicy: "default/authz",
+					},
+				},
+			}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{{
+					Source: model.FullyQualifiedResource{Name: "authz", Namespace: "default"},
+					Authorization: &model.GatewayAuthorization{
+						Rules: []model.GatewayAuthorizationRule{{Methods: []string{"GET"}}},
+					},
+				}},
+			},
+		}
+
+		cfg := getTypedPerFilterConfig(m, authFilters[0], authFilters, model.HTTPRoute{ExternalAuth: authFilters[0]})
+		require.Contains(t, cfg, ExtAuthzFilterName(extAuthzFilterKey(authFilters[1])))
+		require.NotContains(t, cfg, ExtAuthzFilterName(extAuthzFilterKey(authFilters[0])))
+
+		perRoute := &extauthzv3.ExtAuthzPerRoute{}
+		require.NoError(t, proto.Unmarshal(cfg[ExtAuthzFilterName(extAuthzFilterKey(authFilters[1]))].Value, perRoute))
+		require.True(t, perRoute.GetDisabled())
+
+		rbacPerRoute := &rbacv3.RBACPerRoute{}
+		require.NoError(t, proto.Unmarshal(cfg[GatewayAuthorizationFilterName].Value, rbacPerRoute))
+		require.Nil(t, rbacPerRoute.GetRbac())
 	})
 }
 

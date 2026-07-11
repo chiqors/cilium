@@ -21,6 +21,8 @@ type CiliumDatapathPluginExpansion interface{}
 
 type CiliumEndpointSliceExpansion interface{}
 
+type CiliumGatewayAuthPolicyExpansion interface{}
+
 type CiliumGatewayClassConfigExpansion interface{}
 
 type CiliumL2AnnouncementPolicyExpansion interface{}

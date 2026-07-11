@@ -12,8 +12,12 @@ import (
 	"time"
 
 	envoy_config_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	basicauthv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/basic_auth/v3"
 	envoy_extensions_filters_http_cors_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
 	extauthzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
+	jwtauthnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
+	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
+	rbacv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
 	envoy_type_matcher_v3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -723,7 +727,7 @@ func Test_envoyHTTPRoutes(t *testing.T) {
 				},
 			},
 		}
-		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil)
+		res := envoyHTTPRoutes(nil, httpRoutes, []string{"*"}, true, 80, nil)
 		require.Len(t, res, 2)
 		// Redirect Route
 		require.NotNil(t, res[0])
@@ -775,7 +779,7 @@ func Test_envoyHTTPRoutes(t *testing.T) {
 				},
 			},
 		}
-		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil)
+		res := envoyHTTPRoutes(nil, httpRoutes, []string{"*"}, true, 80, nil)
 		require.Len(t, res, 1)
 		require.NotNil(t, res[0])
 		require.NotNil(t, res[0].GetDirectResponse())
@@ -795,7 +799,7 @@ func Test_envoyHTTPSRoutes_disablesExtAuthzFilters(t *testing.T) {
 		{PathMatch: model.StringMatch{Prefix: "/"}},
 	}
 
-	result := envoyHTTPSRoutes(routes, []string{"example.com"}, false, authFilters)
+	result := envoyHTTPSRoutes(nil, routes, []string{"example.com"}, false, authFilters)
 	require.Len(t, result, 1)
 
 	// The redirect route must disable all auth filters so that redirect requests
@@ -840,7 +844,7 @@ func Test_envoyHTTPRoutes_differentAuthFilters(t *testing.T) {
 		},
 	}
 
-	res := envoyHTTPRoutes(httpRoutes, []string{"*"}, false, 80, allAuthFilters)
+	res := envoyHTTPRoutes(nil, httpRoutes, []string{"*"}, false, 80, allAuthFilters)
 	require.Len(t, res, 2, "routes with different auth filters must not be merged")
 
 	filterNameA := ExtAuthzFilterName(extAuthzFilterKey(authA))
@@ -869,9 +873,262 @@ func Test_envoyHTTPSRoutes_noAuthFilters(t *testing.T) {
 	routes := []model.HTTPRoute{
 		{PathMatch: model.StringMatch{Prefix: "/"}},
 	}
-	result := envoyHTTPSRoutes(routes, []string{"example.com"}, false, nil)
+	result := envoyHTTPSRoutes(nil, routes, []string{"example.com"}, false, nil)
 	require.Len(t, result, 1)
 	require.Nil(t, result[0].TypedPerFilterConfig, "redirect route must not set TypedPerFilterConfig when there are no auth filters")
+}
+
+func Test_envoyHTTPRoutes_differentGatewayBasicAuthPolicies(t *testing.T) {
+	m := &model.Model{
+		HTTP: []model.HTTPListener{{
+			Routes: []model.HTTPRoute{
+				{
+					PathMatch:         model.StringMatch{Prefix: "/"},
+					GatewayAuthPolicy: "default/basic-a",
+					Backends: []model.Backend{
+						{Name: "svc-a", Namespace: "ns", Port: &model.BackendPort{Port: 80}},
+					},
+				},
+				{
+					PathMatch:         model.StringMatch{Prefix: "/"},
+					GatewayAuthPolicy: "default/basic-b",
+					Backends: []model.Backend{
+						{Name: "svc-b", Namespace: "ns", Port: &model.BackendPort{Port: 80}},
+					},
+				},
+			},
+		}},
+		GatewayAuth: &model.GatewayAuthModel{
+			Policies: []model.GatewayAuthPolicy{
+				{
+					Source:    model.FullyQualifiedResource{Name: "basic-a", Namespace: "default"},
+					BasicAuth: &model.GatewayBasicAuth{Secret: model.GatewayAuthSecretRef{Found: true, Value: []byte("alice:$apr1$hash")}},
+				},
+				{
+					Source:    model.FullyQualifiedResource{Name: "basic-b", Namespace: "default"},
+					BasicAuth: &model.GatewayBasicAuth{Secret: model.GatewayAuthSecretRef{Found: true, Value: []byte("bob:$apr1$hash")}, UsernameHeader: "x-user"},
+				},
+			},
+		},
+	}
+
+	res := envoyHTTPRoutes(m, m.HTTP[0].Routes, []string{"*"}, false, 80, nil)
+	require.Len(t, res, 2, "routes with different selected gateway auth policies must not be merged")
+
+	perRouteA := &basicauthv3.BasicAuthPerRoute{}
+	require.NoError(t, proto.Unmarshal(res[0].TypedPerFilterConfig[basicAuthFilterName("default")].Value, perRouteA))
+	require.Equal(t, "alice:$apr1$hash", perRouteA.GetUsers().GetInlineString())
+
+	perRouteB := &basicauthv3.BasicAuthPerRoute{}
+	require.NoError(t, proto.Unmarshal(res[1].TypedPerFilterConfig[basicAuthFilterName("username-header:x-user")].Value, perRouteB))
+	require.Equal(t, "bob:$apr1$hash", perRouteB.GetUsers().GetInlineString())
+}
+
+func Test_envoyHTTPRoutes_differentGatewayAPIKeyPolicies(t *testing.T) {
+	m := &model.Model{
+		HTTP: []model.HTTPListener{{
+			Routes: []model.HTTPRoute{
+				{
+					PathMatch:         model.StringMatch{Prefix: "/"},
+					GatewayAuthPolicy: "default/api-key-a",
+					Backends: []model.Backend{
+						{Name: "svc-a", Namespace: "ns", Port: &model.BackendPort{Port: 80}},
+					},
+				},
+				{
+					PathMatch:         model.StringMatch{Prefix: "/"},
+					GatewayAuthPolicy: "default/api-key-b",
+					Backends: []model.Backend{
+						{Name: "svc-b", Namespace: "ns", Port: &model.BackendPort{Port: 80}},
+					},
+				},
+			},
+		}},
+		GatewayAuth: &model.GatewayAuthModel{
+			Policies: []model.GatewayAuthPolicy{
+				{
+					Source: model.FullyQualifiedResource{Name: "api-key-a", Namespace: "default"},
+					APIKeyAuth: &model.GatewayAPIKeyAuth{
+						Sources:     []model.GatewayAPIKeySource{{Type: "Header", Name: "x-api-key"}},
+						Credentials: []model.GatewayAPIKeyCredential{{Secret: model.GatewayAuthSecretRef{Found: true, Value: []byte("secret-a")}, Identity: "client-a"}},
+					},
+				},
+				{
+					Source: model.FullyQualifiedResource{Name: "api-key-b", Namespace: "default"},
+					APIKeyAuth: &model.GatewayAPIKeyAuth{
+						Sources:         []model.GatewayAPIKeySource{{Type: "Cookie", Name: "session"}},
+						Credentials:     []model.GatewayAPIKeyCredential{{Secret: model.GatewayAuthSecretRef{Found: true, Value: []byte("secret-b")}, Identity: "client-b"}},
+						IdentityHeader:  "x-identity",
+						StripCredential: true,
+					},
+				},
+			},
+		},
+	}
+
+	res := envoyHTTPRoutes(m, m.HTTP[0].Routes, []string{"*"}, false, 80, nil)
+	require.Len(t, res, 2, "routes with different selected gateway api key policies must not be merged")
+
+	perRouteA := &luav3.LuaPerRoute{}
+	require.NoError(t, proto.Unmarshal(res[0].TypedPerFilterConfig[APIKeyAuthFilterName].Value, perRouteA))
+	require.Equal(t, "x-api-key", perRouteA.GetFilterContext().GetFields()["sources"].GetListValue().GetValues()[0].GetStructValue().GetFields()["name"].GetStringValue())
+
+	perRouteB := &luav3.LuaPerRoute{}
+	require.NoError(t, proto.Unmarshal(res[1].TypedPerFilterConfig[APIKeyAuthFilterName].Value, perRouteB))
+	require.Equal(t, "x-identity", perRouteB.GetFilterContext().GetFields()["identity_header"].GetStringValue())
+	require.True(t, perRouteB.GetFilterContext().GetFields()["strip_credential"].GetBoolValue())
+}
+
+func Test_envoyHTTPRoutes_differentGatewayJWTPolicies(t *testing.T) {
+	m := &model.Model{
+		HTTP: []model.HTTPListener{{
+			Routes: []model.HTTPRoute{
+				{
+					PathMatch:         model.StringMatch{Prefix: "/"},
+					GatewayAuthPolicy: "default/jwt-a",
+					Backends: []model.Backend{
+						{Name: "svc-a", Namespace: "ns", Port: &model.BackendPort{Port: 80}},
+					},
+				},
+				{
+					PathMatch:         model.StringMatch{Prefix: "/"},
+					GatewayAuthPolicy: "default/jwt-b",
+					Backends: []model.Backend{
+						{Name: "svc-b", Namespace: "ns", Port: &model.BackendPort{Port: 80}},
+					},
+				},
+			},
+		}},
+		GatewayAuth: &model.GatewayAuthModel{
+			Policies: []model.GatewayAuthPolicy{
+				{
+					Source: model.FullyQualifiedResource{Name: "jwt-a", Namespace: "default"},
+					JWT: &model.GatewayJWTAuth{
+						Issuer:        "https://issuer-a.example.com",
+						RemoteJWKSURI: "https://issuer-a.example.com/jwks.json",
+					},
+				},
+				{
+					Source: model.FullyQualifiedResource{Name: "jwt-b", Namespace: "default"},
+					JWT: &model.GatewayJWTAuth{
+						Issuer: "https://issuer-b.example.com",
+						LocalJWKS: &model.GatewayLocalJWKS{
+							Secret: &model.GatewayAuthSecretRef{Found: true, Value: []byte(`{"keys":[{"kid":"b"}]}`)},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	res := envoyHTTPRoutes(m, m.HTTP[0].Routes, []string{"*"}, false, 80, nil)
+	require.Len(t, res, 2, "routes with different selected gateway jwt policies must not be merged")
+
+	perRouteA := &jwtauthnv3.PerRouteConfig{}
+	require.NoError(t, proto.Unmarshal(res[0].TypedPerFilterConfig[JWTAuthFilterName].Value, perRouteA))
+	require.Equal(t, "default/jwt-a", perRouteA.GetRequirementName())
+
+	perRouteB := &jwtauthnv3.PerRouteConfig{}
+	require.NoError(t, proto.Unmarshal(res[1].TypedPerFilterConfig[JWTAuthFilterName].Value, perRouteB))
+	require.Equal(t, "default/jwt-b", perRouteB.GetRequirementName())
+}
+
+func Test_envoyHTTPRoutes_differentGatewayOIDCPolicies(t *testing.T) {
+	m := &model.Model{
+		HTTP: []model.HTTPListener{{
+			Routes: []model.HTTPRoute{
+				{
+					PathMatch:         model.StringMatch{Prefix: "/"},
+					GatewayAuthPolicy: "default/oidc-a",
+					Backends:          []model.Backend{{Name: "svc-a", Namespace: "ns", Port: &model.BackendPort{Port: 80}}},
+				},
+				{
+					PathMatch:         model.StringMatch{Prefix: "/"},
+					GatewayAuthPolicy: "default/oidc-b",
+					Backends:          []model.Backend{{Name: "svc-b", Namespace: "ns", Port: &model.BackendPort{Port: 80}}},
+				},
+			},
+		}},
+		GatewayAuth: &model.GatewayAuthModel{
+			Policies: []model.GatewayAuthPolicy{
+				{
+					Source: model.FullyQualifiedResource{Name: "oidc-a", Namespace: "default"},
+					OIDC: &model.GatewayOIDCAuth{
+						ClientID:     "client-a",
+						ClientSecret: model.GatewayAuthSecretRef{Name: "client-a", Found: true},
+						CookieSecret: model.GatewayAuthSecretRef{Name: "cookie-a", Found: true},
+						Endpoints: &model.GatewayOIDCEndpoints{
+							Authorization: "https://issuer-a.example.com/authorize",
+							Token:         "https://issuer-a.example.com/token",
+						},
+					},
+				},
+				{
+					Source: model.FullyQualifiedResource{Name: "oidc-b", Namespace: "default"},
+					OIDC: &model.GatewayOIDCAuth{
+						ClientID:     "client-b",
+						ClientSecret: model.GatewayAuthSecretRef{Name: "client-b", Found: true},
+						CookieSecret: model.GatewayAuthSecretRef{Name: "cookie-b", Found: true},
+						Endpoints: &model.GatewayOIDCEndpoints{
+							Authorization: "https://issuer-b.example.com/authorize",
+							Token:         "https://issuer-b.example.com/token",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	res := envoyHTTPRoutes(m, m.HTTP[0].Routes, []string{"*"}, false, 80, nil)
+	require.Len(t, res, 2)
+
+	_, hasDisableA := res[0].TypedPerFilterConfig[oidcFilterName(m.GatewayAuth.Policies[1])]
+	require.True(t, hasDisableA)
+	_, hasDisableB := res[1].TypedPerFilterConfig[oidcFilterName(m.GatewayAuth.Policies[0])]
+	require.True(t, hasDisableB)
+}
+
+func Test_envoyHTTPRoutes_preservesAuthWithRewrite(t *testing.T) {
+	m := &model.Model{
+		HTTP: []model.HTTPListener{{
+			Routes: []model.HTTPRoute{{
+				PathMatch:         model.StringMatch{Prefix: "/secure"},
+				GatewayAuthPolicy: "default/jwt-authz",
+				Rewrite: &model.HTTPURLRewriteFilter{
+					Path: &model.StringMatch{Prefix: "/internal"},
+				},
+				Backends: []model.Backend{
+					{Name: "svc-a", Namespace: "ns", Port: &model.BackendPort{Port: 80}},
+				},
+			}},
+		}},
+		GatewayAuth: &model.GatewayAuthModel{
+			Policies: []model.GatewayAuthPolicy{{
+				Source: model.FullyQualifiedResource{Name: "jwt-authz", Namespace: "default"},
+				JWT: &model.GatewayJWTAuth{
+					Issuer:        "https://issuer.example.com",
+					RemoteJWKSURI: "https://issuer.example.com/jwks.json",
+				},
+				Authorization: &model.GatewayAuthorization{
+					Rules: []model.GatewayAuthorizationRule{{
+						Methods: []string{"GET"},
+					}},
+				},
+			}},
+		},
+	}
+
+	res := envoyHTTPRoutes(m, m.HTTP[0].Routes, []string{"*"}, false, 80, nil)
+	require.Len(t, res, 1)
+	require.Equal(t, "/internal", res[0].GetRoute().GetPrefixRewrite())
+
+	jwtPerRoute := &jwtauthnv3.PerRouteConfig{}
+	require.NoError(t, proto.Unmarshal(res[0].TypedPerFilterConfig[JWTAuthFilterName].Value, jwtPerRoute))
+	require.Equal(t, "default/jwt-authz", jwtPerRoute.GetRequirementName())
+
+	rbacPerRoute := &rbacv3.RBACPerRoute{}
+	require.NoError(t, proto.Unmarshal(res[0].TypedPerFilterConfig[GatewayAuthorizationFilterName].Value, rbacPerRoute))
+	require.NotNil(t, rbacPerRoute.GetRbac())
 }
 
 func Test_getCORSStringMatcher(t *testing.T) {

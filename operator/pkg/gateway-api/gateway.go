@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -24,6 +25,7 @@ import (
 	watchhandlers "github.com/cilium/cilium/operator/pkg/gateway-api/watch-handlers"
 	"github.com/cilium/cilium/operator/pkg/model/translation"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	ciliumv2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
@@ -43,17 +45,24 @@ type gatewayReconciler struct {
 
 	logger         *slog.Logger
 	controllerName string
+
+	enableGatewayAPIAuthPolicy bool
+	oidcDiscoveryClient        *http.Client
+	oidcDiscoveryCache         *oidcDiscoveryCache
 }
 
-func newGatewayReconciler(mgr ctrl.Manager, translator translation.Translator, logger *slog.Logger, controllerName string) *gatewayReconciler {
+func newGatewayReconciler(mgr ctrl.Manager, translator translation.Translator, logger *slog.Logger, controllerName string, enableGatewayAPIAuthPolicy bool) *gatewayReconciler {
 	scopedLog := logger.With(logfields.Controller, gateway)
 
 	return &gatewayReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		translator:     translator,
-		logger:         scopedLog,
-		controllerName: controllerName,
+		Client:                     mgr.GetClient(),
+		Scheme:                     mgr.GetScheme(),
+		translator:                 translator,
+		logger:                     scopedLog,
+		controllerName:             controllerName,
+		enableGatewayAPIAuthPolicy: enableGatewayAPIAuthPolicy,
+		oidcDiscoveryClient:        &http.Client{Timeout: oidcDiscoveryTimeout},
+		oidcDiscoveryCache:         newOIDCDiscoveryCache(oidcDiscoveryCacheTTL),
 	}
 }
 
@@ -144,6 +153,20 @@ func (r *gatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("failed to setup field indexer %q: %w", indexers.BackendTLSPolicyConfigMapIndex, err)
 	}
 
+	if r.enableGatewayAPIAuthPolicy {
+		for indexName, indexerFunc := range map[string]client.IndexerFunc{
+			indexers.GatewayAuthPolicySecretIndex:          indexers.IndexCiliumGatewayAuthPolicyBySecret,
+			indexers.GatewayAuthPolicyConfigMapIndex:       indexers.IndexCiliumGatewayAuthPolicyByConfigMap,
+			indexers.GatewayAuthPolicyGatewayTargetIndex:   indexers.IndexCiliumGatewayAuthPolicyByGateway,
+			indexers.GatewayAuthPolicyHTTPRouteTargetIndex: indexers.IndexCiliumGatewayAuthPolicyByHTTPRoute,
+			indexers.GatewayAuthPolicyGRPCRouteTargetIndex: indexers.IndexCiliumGatewayAuthPolicyByGRPCRoute,
+		} {
+			if err := mgr.GetFieldIndexer().IndexField(context.Background(), &ciliumv2alpha1.CiliumGatewayAuthPolicy{}, indexName, indexerFunc); err != nil {
+				return fmt.Errorf("failed to setup field indexer %q: %w", indexName, err)
+			}
+		}
+	}
+
 	// Index ListenerSets by parent Gateway, and routes by ListenerSet parentRefs
 	if listenerSetEnabled {
 		if err := mgr.GetFieldIndexer().IndexField(context.Background(), &gatewayv1.ListenerSet{}, indexers.ListenerSetGatewayIndex, indexers.IndexListenerSetByGateway); err != nil {
@@ -211,6 +234,15 @@ func (r *gatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&ciliumv2.CiliumEnvoyConfig{}).
 		Owns(&corev1.Service{}).
 		Owns(&discoveryv1.EndpointSlice{})
+
+	if r.enableGatewayAPIAuthPolicy {
+		gatewayBuilder = gatewayBuilder.
+			Watches(&ciliumv2alpha1.CiliumGatewayAuthPolicy{}, watchhandlers.EnqueueRequestForCiliumGatewayAuthPolicy(r.Client, r.logger)).
+			Watches(&corev1.Secret{},
+				watchhandlers.EnqueueRequestForCiliumGatewayAuthPolicySecret(r.Client, r.logger),
+				builder.WithPredicates(predicate.NewPredicateFuncs(predicates.SecretReferencedByCiliumGatewayAuthPolicyFn(r.Client, r.logger)))).
+			Watches(&corev1.ConfigMap{}, watchhandlers.EnqueueRequestForCiliumGatewayAuthPolicyConfigMap(r.Client, r.logger))
+	}
 
 	if tcpRouteEnabled {
 		// Watch TCPRoute linked to Gateway

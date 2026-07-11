@@ -4,10 +4,12 @@
 package ingestion
 
 import (
+	"bytes"
 	"cmp"
 	"fmt"
 	"log/slog"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -133,18 +135,22 @@ type Input struct {
 	GatewayClass       gatewayv1.GatewayClass
 	GatewayClassConfig *v2alpha1.CiliumGatewayClassConfig
 
-	Gateway             gatewayv1.Gateway
-	HTTPRoutes          []gatewayv1.HTTPRoute
-	TLSRoutes           []gatewayv1.TLSRoute
-	GRPCRoutes          []gatewayv1.GRPCRoute
-	TCPRoutes           []gatewayv1.TCPRoute
-	UDPRoutes           []gatewayv1.UDPRoute
-	ReferenceGrants     []gatewayv1.ReferenceGrant
-	Namespaces          []corev1.Namespace
-	Services            []corev1.Service
-	ServiceImports      []mcsapiv1beta1.ServiceImport
-	BackendTLSPolicyMap helpers.BackendTLSPolicyServiceMap
-	MergedListeners     []ListenerWithContext
+	Gateway                gatewayv1.Gateway
+	HTTPRoutes             []gatewayv1.HTTPRoute
+	TLSRoutes              []gatewayv1.TLSRoute
+	GRPCRoutes             []gatewayv1.GRPCRoute
+	TCPRoutes              []gatewayv1.TCPRoute
+	UDPRoutes              []gatewayv1.UDPRoute
+	ReferenceGrants        []gatewayv1.ReferenceGrant
+	Namespaces             []corev1.Namespace
+	Services               []corev1.Service
+	ServiceImports         []mcsapiv1beta1.ServiceImport
+	BackendTLSPolicyMap    helpers.BackendTLSPolicyServiceMap
+	MergedListeners        []ListenerWithContext
+	AuthPolicyAttachments  *helpers.CiliumGatewayAuthPolicyAttachments
+	AuthPolicySecrets      map[types.NamespacedName]corev1.Secret
+	AuthPolicyConfigMaps   map[types.NamespacedName]corev1.ConfigMap
+	AuthPolicyOIDCMetadata map[types.NamespacedName]model.GatewayOIDCEndpoints
 }
 
 // GatewayAPI translates Gateway API resources into a model.
@@ -229,8 +235,9 @@ func GatewayAPI(log *slog.Logger, input Input) *model.Model {
 			// validate-and-record status phase of the reconcile pipeline.
 			namespacesPreFiltered := l.AllowedNamespaces != nil
 
-			httpRoutes = append(httpRoutes, toHTTPRoutes(log, l.Listener, l.Source.Namespace, namespaceLabels, namespacesPreFiltered, listenerHostnamesByProtocol, filteredHTTPRoutes, input.Services, input.ServiceImports, input.ReferenceGrants, input.BackendTLSPolicyMap)...)
-			httpRoutes = append(httpRoutes, toGRPCRoutes(l.Listener, l.Source.Namespace, namespaceLabels, namespacesPreFiltered, listenerHostnamesByProtocol, filteredGRPCRoutes, input.Services, input.ServiceImports, input.ReferenceGrants)...)
+			includeAuthRouteMetadata := input.AuthPolicyAttachments != nil
+			httpRoutes = append(httpRoutes, toHTTPRoutes(log, l.Listener, l.Source.Namespace, namespaceLabels, namespacesPreFiltered, listenerHostnamesByProtocol, filteredHTTPRoutes, input.Services, input.ServiceImports, input.ReferenceGrants, input.BackendTLSPolicyMap, includeAuthRouteMetadata)...)
+			httpRoutes = append(httpRoutes, toGRPCRoutes(l.Listener, l.Source.Namespace, namespaceLabels, namespacesPreFiltered, listenerHostnamesByProtocol, filteredGRPCRoutes, input.Services, input.ServiceImports, input.ReferenceGrants, includeAuthRouteMetadata)...)
 			resHTTP = append(resHTTP, model.HTTPListener{
 				Name:           string(l.Name),
 				Sources:        []model.FullyQualifiedResource{l.Source},
@@ -284,7 +291,9 @@ func GatewayAPI(log *slog.Logger, input Input) *model.Model {
 		HTTP:           resHTTP,
 		TLSPassthrough: resTLSPassthrough,
 		L4:             resL4,
+		GatewayAuth:    toGatewayAuthModel(input),
 	}
+	applyGatewayAuthSelections(m)
 
 	if input.GatewayClassConfig != nil {
 		// HTTP Options
@@ -305,6 +314,687 @@ func GatewayAPI(log *slog.Logger, input Input) *model.Model {
 	}
 
 	return m
+}
+
+func applyGatewayAuthSelections(m *model.Model) {
+	if m == nil || m.GatewayAuth == nil {
+		return
+	}
+
+	bindings := make(map[string]string, len(m.GatewayAuth.Bindings))
+	for _, binding := range m.GatewayAuth.Bindings {
+		bindings[gatewayAuthScopeKey(binding.Scope)] = types.NamespacedName{
+			Namespace: binding.Policy.Namespace,
+			Name:      binding.Policy.Name,
+		}.String()
+	}
+
+	for i := range m.HTTP {
+		listenerName := m.HTTP[i].Name
+		for j := range m.HTTP[i].Routes {
+			route := &m.HTTP[i].Routes[j]
+			if route.SourceResource == nil {
+				continue
+			}
+
+			level := model.GatewayAuthAttachmentLevelHTTPRoute
+			ruleLevel := model.GatewayAuthAttachmentLevelHTTPRule
+			if route.IsGRPC {
+				level = model.GatewayAuthAttachmentLevelGRPCRoute
+				ruleLevel = model.GatewayAuthAttachmentLevelGRPCRouteRule
+			}
+
+			if route.SourceRuleName != "" {
+				if policy, ok := bindings[gatewayAuthScopeKey(model.GatewayAuthAttachment{
+					Level:        ruleLevel,
+					ListenerName: listenerName,
+					Route:        route.SourceResource,
+					RouteRule:    route.SourceRuleName,
+				})]; ok {
+					route.GatewayAuthPolicy = policy
+					continue
+				}
+			}
+
+			if policy, ok := bindings[gatewayAuthScopeKey(model.GatewayAuthAttachment{
+				Level:        level,
+				ListenerName: listenerName,
+				Route:        route.SourceResource,
+			})]; ok {
+				route.GatewayAuthPolicy = policy
+			}
+		}
+	}
+}
+
+func gatewayAuthScopeKey(scope model.GatewayAuthAttachment) string {
+	key := string(scope.Level) + ":" + scope.ListenerName
+	if scope.Route != nil {
+		key += ":" + scope.Route.String()
+	}
+	if scope.RouteRule != "" {
+		key += ":" + scope.RouteRule
+	}
+	return key
+}
+
+func toGatewayAuthModel(input Input) *model.GatewayAuthModel {
+	if input.AuthPolicyAttachments == nil {
+		return nil
+	}
+
+	policies := make([]model.GatewayAuthPolicy, 0)
+
+	policies = append(policies, toGatewayAuthPoliciesForAttachments(
+		input.AuthPolicyAttachments.Gateway.Resource,
+		model.GatewayAuthAttachment{Level: model.GatewayAuthAttachmentLevelGateway},
+		input.AuthPolicySecrets,
+		input.AuthPolicyConfigMaps,
+		input.AuthPolicyOIDCMetadata,
+	)...)
+
+	gatewaySections := make([]gatewayv1.SectionName, 0, len(input.AuthPolicyAttachments.Gateway.Sections))
+	for section := range input.AuthPolicyAttachments.Gateway.Sections {
+		gatewaySections = append(gatewaySections, section)
+	}
+	slices.Sort(gatewaySections)
+	for _, section := range gatewaySections {
+		policies = append(policies, toGatewayAuthPoliciesForAttachments(
+			input.AuthPolicyAttachments.Gateway.Sections[section],
+			model.GatewayAuthAttachment{
+				Level:        model.GatewayAuthAttachmentLevelListener,
+				ListenerName: string(section),
+			},
+			input.AuthPolicySecrets,
+			input.AuthPolicyConfigMaps,
+			input.AuthPolicyOIDCMetadata,
+		)...)
+	}
+
+	httpRouteKeys := make([]types.NamespacedName, 0, len(input.AuthPolicyAttachments.HTTPRoutes))
+	for key := range input.AuthPolicyAttachments.HTTPRoutes {
+		httpRouteKeys = append(httpRouteKeys, key)
+	}
+	slices.SortFunc(httpRouteKeys, func(a, b types.NamespacedName) int {
+		if c := cmp.Compare(a.Namespace, b.Namespace); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Name, b.Name)
+	})
+	for _, key := range httpRouteKeys {
+		collection := input.AuthPolicyAttachments.HTTPRoutes[key]
+		policies = append(policies, toGatewayAuthPoliciesForAttachments(
+			collection.Resource,
+			model.GatewayAuthAttachment{
+				Level: model.GatewayAuthAttachmentLevelHTTPRoute,
+				Route: &types.NamespacedName{Namespace: key.Namespace, Name: key.Name},
+			},
+			input.AuthPolicySecrets,
+			input.AuthPolicyConfigMaps,
+			input.AuthPolicyOIDCMetadata,
+		)...)
+
+		sections := make([]gatewayv1.SectionName, 0, len(collection.Sections))
+		for section := range collection.Sections {
+			sections = append(sections, section)
+		}
+		slices.Sort(sections)
+		for _, section := range sections {
+			policies = append(policies, toGatewayAuthPoliciesForAttachments(
+				collection.Sections[section],
+				model.GatewayAuthAttachment{
+					Level:     model.GatewayAuthAttachmentLevelHTTPRule,
+					Route:     &types.NamespacedName{Namespace: key.Namespace, Name: key.Name},
+					RouteRule: string(section),
+				},
+				input.AuthPolicySecrets,
+				input.AuthPolicyConfigMaps,
+				input.AuthPolicyOIDCMetadata,
+			)...)
+		}
+	}
+
+	grpcRouteKeys := make([]types.NamespacedName, 0, len(input.AuthPolicyAttachments.GRPCRoutes))
+	for key := range input.AuthPolicyAttachments.GRPCRoutes {
+		grpcRouteKeys = append(grpcRouteKeys, key)
+	}
+	slices.SortFunc(grpcRouteKeys, func(a, b types.NamespacedName) int {
+		if c := cmp.Compare(a.Namespace, b.Namespace); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Name, b.Name)
+	})
+	for _, key := range grpcRouteKeys {
+		collection := input.AuthPolicyAttachments.GRPCRoutes[key]
+		policies = append(policies, toGatewayAuthPoliciesForAttachments(
+			collection.Resource,
+			model.GatewayAuthAttachment{
+				Level: model.GatewayAuthAttachmentLevelGRPCRoute,
+				Route: &types.NamespacedName{Namespace: key.Namespace, Name: key.Name},
+			},
+			input.AuthPolicySecrets,
+			input.AuthPolicyConfigMaps,
+			input.AuthPolicyOIDCMetadata,
+		)...)
+
+		sections := make([]gatewayv1.SectionName, 0, len(collection.Sections))
+		for section := range collection.Sections {
+			sections = append(sections, section)
+		}
+		slices.Sort(sections)
+		for _, section := range sections {
+			policies = append(policies, toGatewayAuthPoliciesForAttachments(
+				collection.Sections[section],
+				model.GatewayAuthAttachment{
+					Level:     model.GatewayAuthAttachmentLevelGRPCRouteRule,
+					Route:     &types.NamespacedName{Namespace: key.Namespace, Name: key.Name},
+					RouteRule: string(section),
+				},
+				input.AuthPolicySecrets,
+				input.AuthPolicyConfigMaps,
+				input.AuthPolicyOIDCMetadata,
+			)...)
+		}
+	}
+
+	if len(policies) == 0 {
+		return nil
+	}
+
+	bindings, conflicts := resolveGatewayAuthPolicyPrecedence(input, policies)
+
+	return &model.GatewayAuthModel{
+		Policies:  policies,
+		Bindings:  bindings,
+		Conflicts: conflicts,
+	}
+}
+
+func toGatewayAuthPoliciesForAttachments(
+	attachments []helpers.CiliumGatewayAuthPolicyAttachment,
+	attachmentMeta model.GatewayAuthAttachment,
+	secrets map[types.NamespacedName]corev1.Secret,
+	configMaps map[types.NamespacedName]corev1.ConfigMap,
+	oidcMetadata map[types.NamespacedName]model.GatewayOIDCEndpoints,
+) []model.GatewayAuthPolicy {
+	policies := make([]model.GatewayAuthPolicy, 0, len(attachments))
+	for _, attachment := range attachments {
+		policy := attachment.Policy
+		if policy == nil {
+			continue
+		}
+
+		policies = append(policies, model.GatewayAuthPolicy{
+			Source: model.FullyQualifiedResource{
+				Name:      policy.GetName(),
+				Namespace: policy.GetNamespace(),
+				Group:     v2alpha1.SchemeGroupVersion.Group,
+				Version:   v2alpha1.SchemeGroupVersion.Version,
+				Kind:      v2alpha1.CGAPKindDefinition,
+				UID:       string(policy.GetUID()),
+			},
+			Target: model.GatewayAuthTarget{
+				Kind:        string(attachment.TargetRef.Kind),
+				Namespace:   policy.GetNamespace(),
+				Name:        string(attachment.TargetRef.Name),
+				SectionName: sectionNameString(attachment.TargetRef.SectionName),
+			},
+			Attachment:        attachmentMeta,
+			CreationTimestamp: policy.GetCreationTimestamp().Time,
+			BasicAuth:         toGatewayBasicAuth(policy.Spec.BasicAuth, policy.GetNamespace(), secrets),
+			APIKeyAuth:        toGatewayAPIKeyAuth(policy.Spec.APIKeyAuth, policy.GetNamespace(), secrets),
+			JWT:               toGatewayJWTAuth(policy.Spec.JWT, policy.GetNamespace(), secrets, configMaps),
+			OIDC:              toGatewayOIDCAuth(policy.Spec.OIDC, policy.GetNamespace(), policy.GetName(), secrets, oidcMetadata),
+			Authorization:     toGatewayAuthorization(policy.Spec.Authorization),
+		})
+	}
+	return policies
+}
+
+func toGatewayBasicAuth(auth *v2alpha1.CiliumGatewayBasicAuth, namespace string, secrets map[types.NamespacedName]corev1.Secret) *model.GatewayBasicAuth {
+	if auth == nil {
+		return nil
+	}
+	return &model.GatewayBasicAuth{
+		Secret:         resolveSecretRef(auth.Secret, namespace, secrets),
+		UsernameHeader: ptr.Deref(auth.UsernameHeader, ""),
+	}
+}
+
+func toGatewayAPIKeyAuth(auth *v2alpha1.CiliumGatewayAPIKeyAuth, namespace string, secrets map[types.NamespacedName]corev1.Secret) *model.GatewayAPIKeyAuth {
+	if auth == nil {
+		return nil
+	}
+
+	result := &model.GatewayAPIKeyAuth{
+		Sources:         make([]model.GatewayAPIKeySource, 0, len(auth.Sources)),
+		Credentials:     make([]model.GatewayAPIKeyCredential, 0, len(auth.Credentials)),
+		IdentityHeader:  ptr.Deref(auth.IdentityHeader, ""),
+		StripCredential: ptr.Deref(auth.StripCredential, false),
+	}
+
+	for _, source := range auth.Sources {
+		result.Sources = append(result.Sources, model.GatewayAPIKeySource{
+			Type: string(source.Type),
+			Name: source.Name,
+		})
+	}
+	for _, credential := range auth.Credentials {
+		result.Credentials = append(result.Credentials, model.GatewayAPIKeyCredential{
+			Secret:   resolveSecretRef(credential.Secret, namespace, secrets),
+			Identity: ptr.Deref(credential.Identity, ""),
+		})
+	}
+
+	return result
+}
+
+func toGatewayJWTAuth(
+	auth *v2alpha1.CiliumGatewayJWTAuth,
+	namespace string,
+	secrets map[types.NamespacedName]corev1.Secret,
+	configMaps map[types.NamespacedName]corev1.ConfigMap,
+) *model.GatewayJWTAuth {
+	if auth == nil {
+		return nil
+	}
+
+	result := &model.GatewayJWTAuth{
+		Issuer:         auth.Issuer,
+		Audiences:      slices.Clone(auth.Audiences),
+		ClaimToHeaders: toGatewayClaimToHeaders(auth.ClaimToHeaders),
+	}
+
+	if auth.RemoteJWKS != nil {
+		result.RemoteJWKSURI = auth.RemoteJWKS.URI
+	}
+	if auth.LocalJWKS != nil {
+		result.LocalJWKS = &model.GatewayLocalJWKS{}
+		if auth.LocalJWKS.Secret != nil {
+			secret := resolveSecretRef(*auth.LocalJWKS.Secret, namespace, secrets)
+			result.LocalJWKS.Secret = &secret
+		}
+		if auth.LocalJWKS.ConfigMap != nil {
+			configMap := resolveConfigMapRef(*auth.LocalJWKS.ConfigMap, namespace, configMaps)
+			result.LocalJWKS.ConfigMap = &configMap
+		}
+	}
+
+	return result
+}
+
+func toGatewayOIDCAuth(
+	auth *v2alpha1.CiliumGatewayOIDCAuth,
+	namespace, name string,
+	secrets map[types.NamespacedName]corev1.Secret,
+	discovered map[types.NamespacedName]model.GatewayOIDCEndpoints,
+) *model.GatewayOIDCAuth {
+	if auth == nil {
+		return nil
+	}
+
+	result := &model.GatewayOIDCAuth{
+		Issuer:         auth.Issuer,
+		ClientID:       auth.ClientID,
+		ClientSecret:   resolveSecretRef(auth.ClientSecret, namespace, secrets),
+		CookieSecret:   resolveSecretRef(auth.CookieSecret, namespace, secrets),
+		Scopes:         slices.Clone(auth.Scopes),
+		ClaimToHeaders: toGatewayClaimToHeaders(auth.ClaimToHeaders),
+	}
+
+	if auth.Endpoints != nil {
+		result.Endpoints = &model.GatewayOIDCEndpoints{
+			Authorization: ptr.Deref(auth.Endpoints.Authorization, ""),
+			Token:         ptr.Deref(auth.Endpoints.Token, ""),
+			UserInfo:      ptr.Deref(auth.Endpoints.UserInfo, ""),
+			JWKS:          ptr.Deref(auth.Endpoints.JWKS, ""),
+			EndSession:    ptr.Deref(auth.Endpoints.EndSession, ""),
+		}
+	}
+	if discovered != nil {
+		if metadata, ok := discovered[types.NamespacedName{Namespace: namespace, Name: name}]; ok {
+			result.Endpoints = (&metadata).Merge(result.Endpoints)
+		}
+	}
+
+	return result
+}
+
+func toGatewayAuthorization(auth *v2alpha1.CiliumGatewayAuthorizationPolicy) *model.GatewayAuthorization {
+	if auth == nil {
+		return nil
+	}
+
+	result := &model.GatewayAuthorization{
+		Rules: make([]model.GatewayAuthorizationRule, 0, len(auth.Rules)),
+	}
+	for _, rule := range auth.Rules {
+		result.Rules = append(result.Rules, model.GatewayAuthorizationRule{
+			Principals: slices.Clone(rule.Principals),
+			Claims:     toGatewayMatchAttributes(rule.Claims),
+			Headers:    toGatewayMatchAttributes(rule.Headers),
+			Methods:    slices.Clone(rule.Methods),
+			Paths:      slices.Clone(rule.Paths),
+			Hosts:      slices.Clone(rule.Hosts),
+			CIDRs:      slices.Clone(rule.CIDRs),
+		})
+	}
+	return result
+}
+
+func toGatewayClaimToHeaders(claims []v2alpha1.CiliumGatewayClaimToHeader) []model.GatewayClaimToHeader {
+	if len(claims) == 0 {
+		return nil
+	}
+	result := make([]model.GatewayClaimToHeader, 0, len(claims))
+	for _, claim := range claims {
+		result = append(result, model.GatewayClaimToHeader{
+			Claim:  claim.Claim,
+			Header: claim.Header,
+		})
+	}
+	return result
+}
+
+func toGatewayMatchAttributes(attrs []v2alpha1.CiliumGatewayMatchAttribute) []model.GatewayMatchAttribute {
+	if len(attrs) == 0 {
+		return nil
+	}
+	result := make([]model.GatewayMatchAttribute, 0, len(attrs))
+	for _, attr := range attrs {
+		result = append(result, model.GatewayMatchAttribute{
+			Name:   attr.Name,
+			Values: slices.Clone(attr.Values),
+		})
+	}
+	return result
+}
+
+func resolveSecretRef(ref v2alpha1.CiliumGatewaySecretKeyRef, namespace string, secrets map[types.NamespacedName]corev1.Secret) model.GatewayAuthSecretRef {
+	result := model.GatewayAuthSecretRef{
+		Namespace: namespace,
+		Name:      ref.Name,
+		Key:       ref.Key,
+	}
+	if ref.Name == "" || ref.Key == "" {
+		return result
+	}
+
+	secret, ok := secrets[types.NamespacedName{Namespace: namespace, Name: ref.Name}]
+	if !ok {
+		return result
+	}
+
+	value, ok := secret.Data[ref.Key]
+	if !ok {
+		return result
+	}
+
+	result.Found = true
+	result.Value = bytes.Clone(value)
+	return result
+}
+
+func resolveConfigMapRef(ref v2alpha1.CiliumGatewayConfigMapKeyRef, namespace string, configMaps map[types.NamespacedName]corev1.ConfigMap) model.GatewayAuthConfigMapRef {
+	result := model.GatewayAuthConfigMapRef{
+		Namespace: namespace,
+		Name:      ref.Name,
+		Key:       ref.Key,
+	}
+	if ref.Name == "" || ref.Key == "" {
+		return result
+	}
+
+	configMap, ok := configMaps[types.NamespacedName{Namespace: namespace, Name: ref.Name}]
+	if !ok {
+		return result
+	}
+
+	if value, ok := configMap.Data[ref.Key]; ok {
+		result.Found = true
+		result.Value = []byte(value)
+		return result
+	}
+	if value, ok := configMap.BinaryData[ref.Key]; ok {
+		result.Found = true
+		result.Value = bytes.Clone(value)
+	}
+	return result
+}
+
+func sectionNameString(sectionName *gatewayv1.SectionName) string {
+	if sectionName == nil {
+		return ""
+	}
+	return string(*sectionName)
+}
+
+func resolveGatewayAuthPolicyPrecedence(input Input, policies []model.GatewayAuthPolicy) ([]model.GatewayAuthBinding, []model.GatewayAuthConflict) {
+	type scopeKey struct {
+		level        model.GatewayAuthAttachmentLevel
+		listenerName string
+		routeNS      string
+		routeName    string
+		routeRule    string
+	}
+
+	scopeFromAttachment := func(attachment model.GatewayAuthAttachment) scopeKey {
+		key := scopeKey{
+			level:        attachment.Level,
+			listenerName: attachment.ListenerName,
+			routeRule:    attachment.RouteRule,
+		}
+		if attachment.Route != nil {
+			key.routeNS = attachment.Route.Namespace
+			key.routeName = attachment.Route.Name
+		}
+		return key
+	}
+
+	policyLess := func(a, b model.GatewayAuthPolicy) bool {
+		if a.CreationTimestamp.Equal(b.CreationTimestamp) {
+			aKey := types.NamespacedName{Namespace: a.Source.Namespace, Name: a.Source.Name}
+			bKey := types.NamespacedName{Namespace: b.Source.Namespace, Name: b.Source.Name}
+			return aKey.String() < bKey.String()
+		}
+		return a.CreationTimestamp.Before(b.CreationTimestamp)
+	}
+
+	selected := make(map[scopeKey]int)
+	conflicts := make([]model.GatewayAuthConflict, 0)
+
+	for i := range policies {
+		key := scopeFromAttachment(policies[i].Attachment)
+		if winnerIdx, ok := selected[key]; !ok {
+			selected[key] = i
+		} else if policyLess(policies[i], policies[winnerIdx]) {
+			conflicts = append(conflicts, model.GatewayAuthConflict{
+				Scope:  policies[i].Attachment,
+				Winner: policies[i].Source,
+				Loser:  policies[winnerIdx].Source,
+			})
+			selected[key] = i
+		} else {
+			conflicts = append(conflicts, model.GatewayAuthConflict{
+				Scope:  policies[i].Attachment,
+				Winner: policies[winnerIdx].Source,
+				Loser:  policies[i].Source,
+			})
+		}
+	}
+
+	listeners := input.MergedListeners
+	if listeners == nil {
+		gwSource := model.FullyQualifiedResource{
+			Name:      input.Gateway.GetName(),
+			Namespace: input.Gateway.GetNamespace(),
+			Group:     gatewayv1.SchemeGroupVersion.Group,
+			Version:   gatewayv1.SchemeGroupVersion.Version,
+			Kind:      "Gateway",
+			UID:       string(input.Gateway.GetUID()),
+		}
+		for _, l := range input.Gateway.Spec.Listeners {
+			listeners = append(listeners, ListenerWithContext{
+				Listener: l,
+				Source:   gwSource,
+			})
+		}
+	}
+
+	bindings := make([]model.GatewayAuthBinding, 0)
+	appendBinding := func(scope model.GatewayAuthAttachment, idx int) {
+		if idx < 0 {
+			return
+		}
+		bindings = append(bindings, model.GatewayAuthBinding{
+			Scope:  scope,
+			Policy: policies[idx].Source,
+		})
+	}
+
+	gatewayIdx, hasGateway := selected[scopeKey{level: model.GatewayAuthAttachmentLevelGateway}]
+
+	httpRouteRuleWinners := make(map[types.NamespacedName]map[string]int)
+	httpRouteWinners := make(map[types.NamespacedName]int)
+	grpcRouteRuleWinners := make(map[types.NamespacedName]map[string]int)
+	grpcRouteWinners := make(map[types.NamespacedName]int)
+
+	for key, idx := range selected {
+		switch key.level {
+		case model.GatewayAuthAttachmentLevelHTTPRoute:
+			httpRouteWinners[types.NamespacedName{Namespace: key.routeNS, Name: key.routeName}] = idx
+		case model.GatewayAuthAttachmentLevelHTTPRule:
+			routeKey := types.NamespacedName{Namespace: key.routeNS, Name: key.routeName}
+			if httpRouteRuleWinners[routeKey] == nil {
+				httpRouteRuleWinners[routeKey] = make(map[string]int)
+			}
+			httpRouteRuleWinners[routeKey][key.routeRule] = idx
+		case model.GatewayAuthAttachmentLevelGRPCRoute:
+			grpcRouteWinners[types.NamespacedName{Namespace: key.routeNS, Name: key.routeName}] = idx
+		case model.GatewayAuthAttachmentLevelGRPCRouteRule:
+			routeKey := types.NamespacedName{Namespace: key.routeNS, Name: key.routeName}
+			if grpcRouteRuleWinners[routeKey] == nil {
+				grpcRouteRuleWinners[routeKey] = make(map[string]int)
+			}
+			grpcRouteRuleWinners[routeKey][key.routeRule] = idx
+		}
+	}
+
+	for _, listener := range listeners {
+		listenerIdx := -1
+		if idx, ok := selected[scopeKey{
+			level:        model.GatewayAuthAttachmentLevelListener,
+			listenerName: string(listener.Name),
+		}]; ok {
+			listenerIdx = idx
+		} else if hasGateway {
+			listenerIdx = gatewayIdx
+		}
+
+		appendBinding(model.GatewayAuthAttachment{
+			Level:        model.GatewayAuthAttachmentLevelListener,
+			ListenerName: string(listener.Name),
+		}, listenerIdx)
+
+		for _, route := range listener.FilterHTTPRoutes(input.HTTPRoutes) {
+			routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+			routeIdx := listenerIdx
+			if idx, ok := httpRouteWinners[routeKey]; ok {
+				routeIdx = idx
+			}
+
+			appendBinding(model.GatewayAuthAttachment{
+				Level:        model.GatewayAuthAttachmentLevelHTTPRoute,
+				ListenerName: string(listener.Name),
+				Route:        &types.NamespacedName{Namespace: routeKey.Namespace, Name: routeKey.Name},
+			}, routeIdx)
+
+			for _, rule := range route.Spec.Rules {
+				if rule.Name == nil {
+					continue
+				}
+				ruleIdx := routeIdx
+				if winners := httpRouteRuleWinners[routeKey]; winners != nil {
+					if idx, ok := winners[string(*rule.Name)]; ok {
+						ruleIdx = idx
+					}
+				}
+				appendBinding(model.GatewayAuthAttachment{
+					Level:        model.GatewayAuthAttachmentLevelHTTPRule,
+					ListenerName: string(listener.Name),
+					Route:        &types.NamespacedName{Namespace: routeKey.Namespace, Name: routeKey.Name},
+					RouteRule:    string(*rule.Name),
+				}, ruleIdx)
+			}
+		}
+
+		for _, route := range listener.FilterGRPCRoutes(input.GRPCRoutes) {
+			routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+			routeIdx := listenerIdx
+			if idx, ok := grpcRouteWinners[routeKey]; ok {
+				routeIdx = idx
+			}
+
+			appendBinding(model.GatewayAuthAttachment{
+				Level:        model.GatewayAuthAttachmentLevelGRPCRoute,
+				ListenerName: string(listener.Name),
+				Route:        &types.NamespacedName{Namespace: routeKey.Namespace, Name: routeKey.Name},
+			}, routeIdx)
+
+			for _, rule := range route.Spec.Rules {
+				if rule.Name == nil {
+					continue
+				}
+				ruleIdx := routeIdx
+				if winners := grpcRouteRuleWinners[routeKey]; winners != nil {
+					if idx, ok := winners[string(*rule.Name)]; ok {
+						ruleIdx = idx
+					}
+				}
+				appendBinding(model.GatewayAuthAttachment{
+					Level:        model.GatewayAuthAttachmentLevelGRPCRouteRule,
+					ListenerName: string(listener.Name),
+					Route:        &types.NamespacedName{Namespace: routeKey.Namespace, Name: routeKey.Name},
+					RouteRule:    string(*rule.Name),
+				}, ruleIdx)
+			}
+		}
+	}
+
+	sort.SliceStable(bindings, func(i, j int) bool {
+		if c := cmp.Compare(string(bindings[i].Scope.Level), string(bindings[j].Scope.Level)); c != 0 {
+			return c < 0
+		}
+		if c := cmp.Compare(bindings[i].Scope.ListenerName, bindings[j].Scope.ListenerName); c != 0 {
+			return c < 0
+		}
+		ri, rj := "", ""
+		if bindings[i].Scope.Route != nil {
+			ri = bindings[i].Scope.Route.String()
+		}
+		if bindings[j].Scope.Route != nil {
+			rj = bindings[j].Scope.Route.String()
+		}
+		if c := cmp.Compare(ri, rj); c != 0 {
+			return c < 0
+		}
+		if c := cmp.Compare(bindings[i].Scope.RouteRule, bindings[j].Scope.RouteRule); c != 0 {
+			return c < 0
+		}
+		return bindings[i].Policy.Name < bindings[j].Policy.Name
+	})
+
+	sort.SliceStable(conflicts, func(i, j int) bool {
+		if c := cmp.Compare(string(conflicts[i].Scope.Level), string(conflicts[j].Scope.Level)); c != 0 {
+			return c < 0
+		}
+		if c := cmp.Compare(conflicts[i].Loser.Namespace, conflicts[j].Loser.Namespace); c != 0 {
+			return c < 0
+		}
+		return conflicts[i].Loser.Name < conflicts[j].Loser.Name
+	})
+
+	return bindings, conflicts
 }
 
 func getBackendServiceName(namespace string, services []corev1.Service, serviceImports []mcsapiv1beta1.ServiceImport, backendObjectReference gatewayv1.BackendObjectReference) (string, error) {
@@ -347,6 +1037,7 @@ func toHTTPRoutes(log *slog.Logger,
 	serviceImports []mcsapiv1beta1.ServiceImport,
 	grants []gatewayv1.ReferenceGrant,
 	btlspMap helpers.BackendTLSPolicyServiceMap,
+	includeSourceMetadata bool,
 ) []model.HTTPRoute {
 	var httpRoutes []model.HTTPRoute
 	for _, r := range input {
@@ -410,7 +1101,7 @@ func toHTTPRoutes(log *slog.Logger,
 			computedHost = nil
 		}
 
-		httpRoutes = append(httpRoutes, extractRoutes(log, int32(listener.Port), computedHost, r, services, serviceImports, grants, btlspMap)...)
+		httpRoutes = append(httpRoutes, extractRoutesWithSourceMetadata(log, int32(listener.Port), computedHost, r, services, serviceImports, grants, btlspMap, includeSourceMetadata)...)
 
 	}
 	return httpRoutes
@@ -424,6 +1115,19 @@ func extractRoutes(logger *slog.Logger,
 	serviceImports []mcsapiv1beta1.ServiceImport,
 	grants []gatewayv1.ReferenceGrant,
 	btlspMap helpers.BackendTLSPolicyServiceMap,
+) []model.HTTPRoute {
+	return extractRoutesWithSourceMetadata(logger, listenerPort, hostnames, hr, services, serviceImports, grants, btlspMap, false)
+}
+
+func extractRoutesWithSourceMetadata(logger *slog.Logger,
+	listenerPort int32,
+	hostnames []string,
+	hr gatewayv1.HTTPRoute,
+	services []corev1.Service,
+	serviceImports []mcsapiv1beta1.ServiceImport,
+	grants []gatewayv1.ReferenceGrant,
+	btlspMap helpers.BackendTLSPolicyServiceMap,
+	includeSourceMetadata bool,
 ) []model.HTTPRoute {
 	var httpRoutes []model.HTTPRoute
 	for _, rule := range hr.Spec.Rules {
@@ -557,8 +1261,17 @@ func extractRoutes(logger *slog.Logger,
 			}
 		}
 
+		var sourceResource *types.NamespacedName
+		sourceRuleName := ""
+		if includeSourceMetadata {
+			sourceResource = &types.NamespacedName{Namespace: hr.Namespace, Name: hr.Name}
+			sourceRuleName = sectionNameString(rule.Name)
+		}
+
 		if len(rule.Matches) == 0 {
 			httpRoutes = append(httpRoutes, model.HTTPRoute{
+				SourceResource:         sourceResource,
+				SourceRuleName:         sourceRuleName,
 				Hostnames:              hostnames,
 				Backends:               bes,
 				BackendHTTPFilters:     backendHTTPFilters,
@@ -577,6 +1290,8 @@ func extractRoutes(logger *slog.Logger,
 
 		for _, match := range rule.Matches {
 			httpRoutes = append(httpRoutes, model.HTTPRoute{
+				SourceResource:         sourceResource,
+				SourceRuleName:         sourceRuleName,
 				Hostnames:              hostnames,
 				PathMatch:              toPathMatch(match),
 				HeadersMatch:           toHeaderMatch(match),
@@ -750,6 +1465,7 @@ func toGRPCRoutes(listener gatewayv1beta1.Listener,
 	services []corev1.Service,
 	serviceImports []mcsapiv1beta1.ServiceImport,
 	grants []gatewayv1.ReferenceGrant,
+	includeSourceMetadata bool,
 ) []model.HTTPRoute {
 	var grpcRoutes []model.HTTPRoute
 	for _, r := range input {
@@ -779,12 +1495,16 @@ func toGRPCRoutes(listener gatewayv1beta1.Listener,
 		if len(computedHost) == 1 && computedHost[0] == allHosts {
 			computedHost = nil
 		}
-		grpcRoutes = append(grpcRoutes, extractGRPCRoutes(computedHost, r, services, serviceImports, grants)...)
+		grpcRoutes = append(grpcRoutes, extractGRPCRoutesWithSourceMetadata(computedHost, r, services, serviceImports, grants, includeSourceMetadata)...)
 	}
 	return grpcRoutes
 }
 
 func extractGRPCRoutes(hostnames []string, grpcr gatewayv1.GRPCRoute, services []corev1.Service, serviceImports []mcsapiv1beta1.ServiceImport, grants []gatewayv1.ReferenceGrant) []model.HTTPRoute {
+	return extractGRPCRoutesWithSourceMetadata(hostnames, grpcr, services, serviceImports, grants, false)
+}
+
+func extractGRPCRoutesWithSourceMetadata(hostnames []string, grpcr gatewayv1.GRPCRoute, services []corev1.Service, serviceImports []mcsapiv1beta1.ServiceImport, grants []gatewayv1.ReferenceGrant, includeSourceMetadata bool) []model.HTTPRoute {
 	var grpcRoutes []model.HTTPRoute
 	for _, rule := range grpcr.Spec.Rules {
 		bes := make([]model.Backend, 0, len(rule.BackendRefs))
@@ -857,8 +1577,17 @@ func extractGRPCRoutes(hostnames []string, grpcr gatewayv1.GRPCRoute, services [
 			}
 		}
 
+		var sourceResource *types.NamespacedName
+		sourceRuleName := ""
+		if includeSourceMetadata {
+			sourceResource = &types.NamespacedName{Namespace: grpcr.Namespace, Name: grpcr.Name}
+			sourceRuleName = sectionNameString(rule.Name)
+		}
+
 		if len(rule.Matches) == 0 {
 			grpcRoutes = append(grpcRoutes, model.HTTPRoute{
+				SourceResource:         sourceResource,
+				SourceRuleName:         sourceRuleName,
 				Hostnames:              hostnames,
 				Backends:               bes,
 				DirectResponse:         dr,
@@ -870,6 +1599,8 @@ func extractGRPCRoutes(hostnames []string, grpcr gatewayv1.GRPCRoute, services [
 
 		for _, match := range rule.Matches {
 			grpcRoutes = append(grpcRoutes, model.HTTPRoute{
+				SourceResource:         sourceResource,
+				SourceRuleName:         sourceRuleName,
 				Hostnames:              hostnames,
 				PathMatch:              toGRPCPathMatch(match),
 				HeadersMatch:           toGRPCHeaderMatch(match),

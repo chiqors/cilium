@@ -86,6 +86,8 @@ const (
 	CPIPCRDName = k8sconstv2alpha1.CPIPKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
 	// CGCCCRDName is the full name of the CiliumGatewayClassConfig CRD.
 	CGCCCRDName = k8sconstv2alpha1.CGCCKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
+	// CGAPCRDName is the full name of the CiliumGatewayAuthPolicy CRD.
+	CGAPCRDName = k8sconstv2alpha1.CGAPKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
 
 	// CDPPCRDName is the full name of the CDPP CRD.
 	CDPPCRDName = k8sconstv2alpha1.CDPPKindDefinition + "/" + k8sconstv2alpha1.CustomResourceDefinitionVersion
@@ -183,6 +185,10 @@ func CustomResourceDefinitionList() map[string]*CRDList {
 			Name:     CGCCCRDName,
 			FullName: k8sconstv2alpha1.CGCCName,
 		},
+		synced.CRDResourceName(k8sconstv2alpha1.CGAPName): {
+			Name:     CGAPCRDName,
+			FullName: k8sconstv2alpha1.CGAPName,
+		},
 		synced.CRDResourceName(k8sconstv2alpha1.CDPPName): {
 			Name:     CDPPCRDName,
 			FullName: k8sconstv2alpha1.CDPPName,
@@ -272,6 +278,9 @@ var (
 	//go:embed crds/v2alpha1/ciliumgatewayclassconfigs.yaml
 	crdsv2Alpha1CiliumGatewayClassConfigs []byte
 
+	//go:embed crds/v2alpha1/ciliumgatewayauthpolicies.yaml
+	crdsv2Alpha1CiliumGatewayAuthPolicies []byte
+
 	//go:embed crds/v2alpha1/ciliumdatapathplugins.yaml
 	crdsv2Alpha1CiliumDatapathPlugins []byte
 )
@@ -329,6 +338,8 @@ func GetPregeneratedCRD(logger *slog.Logger, crdName string) apiextensionsv1.Cus
 		crdBytes = crdsv2Alpha1CiliumPodIPPools
 	case CGCCCRDName:
 		crdBytes = crdsv2Alpha1CiliumGatewayClassConfigs
+	case CGAPCRDName:
+		crdBytes = crdsv2Alpha1CiliumGatewayAuthPolicies
 	case CDPPCRDName:
 		crdBytes = crdsv2Alpha1CiliumDatapathPlugins
 	default:

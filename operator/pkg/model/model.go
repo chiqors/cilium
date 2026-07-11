@@ -20,6 +20,7 @@ type Model struct {
 	HTTP           []HTTPListener           `json:"http,omitempty"`
 	TLSPassthrough []TLSPassthroughListener `json:"tls_passthrough,omitempty"`
 	L4             []L4Listener             `json:"l4,omitempty"`
+	GatewayAuth    *GatewayAuthModel        `json:"gateway_auth,omitempty"`
 	HTTPOptions    *HTTPOptions             `json:"http_options,omitempty"`
 	Telemetry      *Telemetry               `json:"telemetry,omitempty"`
 }
@@ -471,6 +472,15 @@ type HTTPCORSFilter struct {
 // HTTPRoute holds all the details needed to route HTTP traffic to a backend.
 type HTTPRoute struct {
 	Name string `json:"name,omitempty"`
+	// SourceResource identifies the originating Gateway API route object when
+	// this HTTPRoute is produced from Gateway ingestion.
+	SourceResource *types.NamespacedName `json:"source_resource,omitempty"`
+	// SourceRuleName identifies the originating named Gateway API rule when
+	// this HTTPRoute is produced from Gateway ingestion.
+	SourceRuleName string `json:"source_rule_name,omitempty"`
+	// GatewayAuthPolicy identifies the selected Gateway auth policy for this
+	// route after precedence resolution. It is an internal translation key.
+	GatewayAuthPolicy string `json:"gateway_auth_policy,omitempty"`
 	// Hostnames that the route should match
 	Hostnames []string `json:"hostnames,omitempty"`
 	// PathMatch specifies that the HTTPRoute should match a path.
@@ -593,6 +603,12 @@ func (r *HTTPRoute) GetMatchKey() string {
 			sb.WriteString(":")
 			sb.WriteString(r.ExternalAuth.Backend.Port.GetPort())
 		}
+		sb.WriteString("|")
+	}
+
+	if r.GatewayAuthPolicy != "" {
+		sb.WriteString("gateway-auth:")
+		sb.WriteString(r.GatewayAuthPolicy)
 		sb.WriteString("|")
 	}
 

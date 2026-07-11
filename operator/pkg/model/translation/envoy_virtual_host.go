@@ -14,12 +14,18 @@ import (
 
 	envoy_config_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoy_config_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	basicauthv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/basic_auth/v3"
 	envoy_extensions_filters_http_cors_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
 	extauthzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
+	jwtauthnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
+	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
+	oauth2v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/oauth2/v3"
+	rbacv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
 	envoy_type_matcher_v3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	envoy_type_v3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/utils/ptr"
 
@@ -124,6 +130,7 @@ func (s SortableRoute) Swap(i, j int) {
 
 // VirtualHostParameter is the parameter for NewVirtualHost
 type VirtualHostParameter struct {
+	Model         *model.Model
 	HostNames     []string
 	HTTPSRedirect bool
 	ListenerPort  uint32
@@ -137,9 +144,9 @@ type VirtualHostParameter struct {
 func (i *cecTranslator) desiredVirtualHost(httpRoutes []model.HTTPRoute, param VirtualHostParameter, mutators ...VirtualHostMutator) *envoy_config_route_v3.VirtualHost {
 	var routes SortableRoute
 	if param.HTTPSRedirect {
-		routes = envoyHTTPSRoutes(httpRoutes, param.HostNames, i.Config.RouteConfig.HostNameSuffixMatch, param.AllAuthFilters)
+		routes = envoyHTTPSRoutes(param.Model, httpRoutes, param.HostNames, i.Config.RouteConfig.HostNameSuffixMatch, param.AllAuthFilters)
 	} else {
-		routes = envoyHTTPRoutes(httpRoutes, param.HostNames, i.Config.RouteConfig.HostNameSuffixMatch, param.ListenerPort, param.AllAuthFilters)
+		routes = envoyHTTPRoutes(param.Model, httpRoutes, param.HostNames, i.Config.RouteConfig.HostNameSuffixMatch, param.ListenerPort, param.AllAuthFilters)
 	}
 
 	// This is to make sure that the Exact match is always having higher priority.
@@ -218,7 +225,7 @@ func getCORS(cors *model.HTTPCORSFilter) *anypb.Any {
 }
 
 // getTypedPerFilterConfig returns the TypedPerFilterConfig map for a route.
-func getTypedPerFilterConfig(routeAuth *model.HTTPExternalAuthFilter, allAuthFilters []*model.HTTPExternalAuthFilter, route model.HTTPRoute) map[string]*anypb.Any {
+func getTypedPerFilterConfig(m *model.Model, routeAuth *model.HTTPExternalAuthFilter, allAuthFilters []*model.HTTPExternalAuthFilter, route model.HTTPRoute) map[string]*anypb.Any {
 	var activeKey string
 	if routeAuth != nil {
 		activeKey = extAuthzFilterKey(routeAuth)
@@ -242,6 +249,77 @@ func getTypedPerFilterConfig(routeAuth *model.HTTPExternalAuthFilter, allAuthFil
 		config[filterName] = disabled
 	}
 
+	activePolicy := getGatewayAuthPolicyForRoute(m, route)
+	activeBasicAuthKey := ""
+	var activeBasicAuthUsers []byte
+	if activePolicy != nil && activePolicy.BasicAuth != nil && activePolicy.BasicAuth.Secret.Found {
+		activeBasicAuthKey = basicAuthFilterKey(activePolicy.BasicAuth)
+		activeBasicAuthUsers = activePolicy.BasicAuth.Secret.Value
+	}
+
+	for _, auth := range getUniqueGatewayBasicAuthFilters(m) {
+		filterName := basicAuthFilterName(basicAuthFilterKey(auth))
+		if activeBasicAuthKey == basicAuthFilterKey(auth) {
+			if len(activeBasicAuthUsers) != 0 {
+				config[filterName] = toAny(&basicauthv3.BasicAuthPerRoute{
+					Users: &envoy_config_core_v3.DataSource{
+						Specifier: &envoy_config_core_v3.DataSource_InlineString{
+							InlineString: string(activeBasicAuthUsers),
+						},
+					},
+				})
+			}
+			continue
+		}
+
+		config[filterName] = toAny(&envoy_config_route_v3.FilterConfig{Disabled: true})
+	}
+
+	if hasGatewayAPIKeyAuth(m) {
+		if activePolicy != nil && activePolicy.APIKeyAuth != nil {
+			config[APIKeyAuthFilterName] = toAny(buildAPIKeyAuthPerRoute(activePolicy.APIKeyAuth))
+		} else {
+			config[APIKeyAuthFilterName] = toAny(&luav3.LuaPerRoute{
+				Override: &luav3.LuaPerRoute_Disabled{Disabled: true},
+			})
+		}
+	}
+
+	for _, policy := range getGatewayOIDCPolicies(m) {
+		filterName := oidcFilterName(policy)
+		if activePolicy != nil && activePolicy.OIDC != nil &&
+			activePolicy.Source.Namespace == policy.Source.Namespace &&
+			activePolicy.Source.Name == policy.Source.Name {
+			continue
+		}
+		config[filterName] = toAny(&oauth2v3.OAuth2{})
+	}
+
+	if hasGatewayJWTAuth(m) {
+		if activePolicy != nil && activePolicy.JWT != nil && buildJWTProvider(*activePolicy) != nil {
+			config[JWTAuthFilterName] = toAny(&jwtauthnv3.PerRouteConfig{
+				RequirementSpecifier: &jwtauthnv3.PerRouteConfig_RequirementName{
+					RequirementName: jwtRequirementName(*activePolicy),
+				},
+			})
+		} else {
+			config[JWTAuthFilterName] = toAny(&jwtauthnv3.PerRouteConfig{
+				RequirementSpecifier: &jwtauthnv3.PerRouteConfig_Disabled{
+					Disabled: true,
+				},
+			})
+		}
+	}
+	if hasGatewayAuthorization(m) {
+		if gatewayAuthPolicyRequiresFailClosed(activePolicy) {
+			config[GatewayAuthorizationFilterName] = toAny(buildGatewayFailClosedPerRoute(activePolicy))
+		} else if activePolicy != nil && activePolicy.Authorization != nil {
+			config[GatewayAuthorizationFilterName] = toAny(buildGatewayAuthorizationPerRoute(activePolicy))
+		} else {
+			config[GatewayAuthorizationFilterName] = toAny(&rbacv3.RBACPerRoute{})
+		}
+	}
+
 	if route.CORS != nil {
 		config["envoy.filters.http.cors"] = getCORS(route.CORS)
 	}
@@ -253,7 +331,41 @@ func getTypedPerFilterConfig(routeAuth *model.HTTPExternalAuthFilter, allAuthFil
 	return config
 }
 
-func envoyHTTPSRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameSuffixMatch bool, allAuthFilters []*model.HTTPExternalAuthFilter) []*envoy_config_route_v3.Route {
+func buildAPIKeyAuthPerRoute(auth *model.GatewayAPIKeyAuth) *luav3.LuaPerRoute {
+	sources := make([]any, 0, len(auth.Sources))
+	for _, source := range auth.Sources {
+		sources = append(sources, map[string]any{
+			"type": source.Type,
+			"name": source.Name,
+		})
+	}
+
+	credentials := make(map[string]any, len(auth.Credentials))
+	for _, credential := range auth.Credentials {
+		if !credential.Secret.Found {
+			continue
+		}
+		if _, exists := credentials[string(credential.Secret.Value)]; !exists {
+			credentials[string(credential.Secret.Value)] = credential.Identity
+		}
+	}
+
+	filterContext, err := structpb.NewStruct(map[string]any{
+		"sources":          sources,
+		"credentials":      credentials,
+		"identity_header":  auth.IdentityHeader,
+		"strip_credential": auth.StripCredential,
+	})
+	if err != nil {
+		filterContext = nil
+	}
+
+	return &luav3.LuaPerRoute{
+		FilterContext: filterContext,
+	}
+}
+
+func envoyHTTPSRoutes(m *model.Model, httpRoutes []model.HTTPRoute, hostnames []string, hostNameSuffixMatch bool, allAuthFilters []*model.HTTPExternalAuthFilter) []*envoy_config_route_v3.Route {
 	matchBackendMap := make(map[string][]model.HTTPRoute)
 	for _, r := range httpRoutes {
 		matchBackendMap[r.GetMatchKey()] = append(matchBackendMap[r.GetMatchKey()], r)
@@ -281,7 +393,7 @@ func envoyHTTPSRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostName
 				hRoutes[0].HeadersMatch,
 				hRoutes[0].Method),
 			Action:               rRedirect,
-			TypedPerFilterConfig: getTypedPerFilterConfig(nil, allAuthFilters, r),
+			TypedPerFilterConfig: getTypedPerFilterConfig(m, nil, allAuthFilters, r),
 		}
 		routes = append(routes, &route)
 		delete(matchBackendMap, r.GetMatchKey())
@@ -289,7 +401,7 @@ func envoyHTTPSRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostName
 	return routes
 }
 
-func envoyHTTPRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameSuffixMatch bool, listenerPort uint32, allAuthFilters []*model.HTTPExternalAuthFilter) []*envoy_config_route_v3.Route {
+func envoyHTTPRoutes(m *model.Model, httpRoutes []model.HTTPRoute, hostnames []string, hostNameSuffixMatch bool, listenerPort uint32, allAuthFilters []*model.HTTPExternalAuthFilter) []*envoy_config_route_v3.Route {
 	matchBackendMap := make(map[string][]model.HTTPRoute)
 	for _, r := range httpRoutes {
 		matchBackendMap[r.GetMatchKey()] = append(matchBackendMap[r.GetMatchKey()], r)
@@ -307,7 +419,7 @@ func envoyHTTPRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameS
 		}
 
 		if len(backends) == 0 && hRoutes[0].RequestRedirect == nil {
-			noBackendRoute := envoyHTTPRouteNoBackend(hRoutes[0], hostnames, hostNameSuffixMatch, allAuthFilters)
+			noBackendRoute := envoyHTTPRouteNoBackend(m, hRoutes[0], hostnames, hostNameSuffixMatch, allAuthFilters)
 			routes = append(routes, noBackendRoute)
 			continue
 		}
@@ -323,7 +435,7 @@ func envoyHTTPRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameS
 			RequestHeadersToRemove:  getHeadersToRemove(hRoutes[0].RequestHeaderFilter),
 			ResponseHeadersToAdd:    getHeadersToAdd(hRoutes[0].ResponseHeaderModifier),
 			ResponseHeadersToRemove: getHeadersToRemove(hRoutes[0].ResponseHeaderModifier),
-			TypedPerFilterConfig:    getTypedPerFilterConfig(hRoutes[0].ExternalAuth, allAuthFilters, r),
+			TypedPerFilterConfig:    getTypedPerFilterConfig(m, hRoutes[0].ExternalAuth, allAuthFilters, r),
 		}
 
 		if hRoutes[0].RequestRedirect != nil {
@@ -620,7 +732,7 @@ func getRouteRedirectMatch(match string) *envoy_config_route_v3.HeaderMatcher {
 	}
 }
 
-func envoyHTTPRouteNoBackend(route model.HTTPRoute, hostnames []string, hostNameSuffixMatch bool, allAuthFilters []*model.HTTPExternalAuthFilter) *envoy_config_route_v3.Route {
+func envoyHTTPRouteNoBackend(m *model.Model, route model.HTTPRoute, hostnames []string, hostNameSuffixMatch bool, allAuthFilters []*model.HTTPExternalAuthFilter) *envoy_config_route_v3.Route {
 	if route.DirectResponse == nil {
 		return nil
 	}
@@ -642,7 +754,7 @@ func envoyHTTPRouteNoBackend(route model.HTTPRoute, hostnames []string, hostName
 				},
 			},
 		},
-		TypedPerFilterConfig: getTypedPerFilterConfig(route.ExternalAuth, allAuthFilters, route),
+		TypedPerFilterConfig: getTypedPerFilterConfig(m, route.ExternalAuth, allAuthFilters, route),
 	}
 }
 

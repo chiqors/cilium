@@ -17,6 +17,7 @@ import (
 
 	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 	"github.com/cilium/cilium/operator/pkg/gateway-api/indexers"
+	ciliumv2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
@@ -73,6 +74,58 @@ func (h *SecretSyncHandler) EnqueueTLSSecrets() handler.EventHandler {
 
 func (h *SecretSyncHandler) IsReferencedByGateway(ctx context.Context, _ client.Client, _ *slog.Logger, obj *corev1.Secret) bool {
 	return len(helpers.GetGatewaysForSecret(ctx, h.client, obj, h.controllerName, h.logger)) > 0
+}
+
+func (h *SecretSyncHandler) EnqueueGatewayAuthPolicySecrets() handler.EventHandler {
+	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+		policy, ok := obj.(*ciliumv2alpha1.CiliumGatewayAuthPolicy)
+		if !ok {
+			return nil
+		}
+
+		var reqs []reconcile.Request
+		add := func(name string) {
+			if name == "" {
+				return
+			}
+			reqs = append(reqs, reconcile.Request{
+				NamespacedName: types.NamespacedName{Namespace: policy.Namespace, Name: name},
+			})
+		}
+
+		if policy.Spec.BasicAuth != nil {
+			add(policy.Spec.BasicAuth.Secret.Name)
+		}
+		if policy.Spec.APIKeyAuth != nil {
+			for _, credential := range policy.Spec.APIKeyAuth.Credentials {
+				add(credential.Secret.Name)
+			}
+		}
+		if policy.Spec.JWT != nil && policy.Spec.JWT.LocalJWKS != nil && policy.Spec.JWT.LocalJWKS.Secret != nil {
+			add(policy.Spec.JWT.LocalJWKS.Secret.Name)
+		}
+		if policy.Spec.OIDC != nil {
+			add(policy.Spec.OIDC.ClientSecret.Name)
+			add(policy.Spec.OIDC.CookieSecret.Name)
+		}
+
+		return reqs
+	})
+}
+
+func (h *SecretSyncHandler) IsReferencedByGatewayOrAuthPolicy(ctx context.Context, _ client.Client, _ *slog.Logger, obj *corev1.Secret) bool {
+	if h.IsReferencedByGateway(ctx, nil, nil, obj) {
+		return true
+	}
+
+	policyList := &ciliumv2alpha1.CiliumGatewayAuthPolicyList{}
+	if err := h.client.List(ctx, policyList, &client.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector(indexers.GatewayAuthPolicySecretIndex, client.ObjectKeyFromObject(obj).String()),
+	}); err != nil {
+		h.logger.ErrorContext(ctx, "Failed to get related CiliumGatewayAuthPolicies for Secret sync", logfields.Error, err)
+		return false
+	}
+	return len(policyList.Items) > 0
 }
 
 // Enqueue BackendTLSPolicyConfigmaps produces a handler.EventHandler that, when it is passed a
@@ -134,4 +187,37 @@ func (h *SecretSyncHandler) ConfigMapIsReferencedInGateway(ctx context.Context, 
 		}
 	}
 	return false
+}
+
+func (h *SecretSyncHandler) EnqueueGatewayAuthPolicyConfigMaps() handler.EventHandler {
+	return handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
+		policy, ok := obj.(*ciliumv2alpha1.CiliumGatewayAuthPolicy)
+		if !ok {
+			return nil
+		}
+		if policy.Spec.JWT == nil || policy.Spec.JWT.LocalJWKS == nil || policy.Spec.JWT.LocalJWKS.ConfigMap == nil || policy.Spec.JWT.LocalJWKS.ConfigMap.Name == "" {
+			return nil
+		}
+		return []reconcile.Request{{
+			NamespacedName: types.NamespacedName{
+				Namespace: policy.Namespace,
+				Name:      policy.Spec.JWT.LocalJWKS.ConfigMap.Name,
+			},
+		}}
+	})
+}
+
+func (h *SecretSyncHandler) ConfigMapIsReferencedInGatewayOrAuthPolicy(ctx context.Context, _ client.Client, _ *slog.Logger, cfgMap *corev1.ConfigMap) bool {
+	if h.ConfigMapIsReferencedInGateway(ctx, nil, nil, cfgMap) {
+		return true
+	}
+
+	policyList := &ciliumv2alpha1.CiliumGatewayAuthPolicyList{}
+	if err := h.client.List(ctx, policyList, &client.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector(indexers.GatewayAuthPolicyConfigMapIndex, client.ObjectKeyFromObject(cfgMap).String()),
+	}); err != nil {
+		h.logger.ErrorContext(ctx, "Failed to get related CiliumGatewayAuthPolicies for ConfigMap sync", logfields.Error, err)
+		return false
+	}
+	return len(policyList.Items) > 0
 }

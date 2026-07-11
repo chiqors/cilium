@@ -5,10 +5,15 @@ package translation
 
 import (
 	"fmt"
+	"net/url"
 	goslices "slices"
+	"strconv"
+	"strings"
 
 	envoy_config_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	envoy_config_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	envoy_config_endpoint_v3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	envoy_config_tls_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	envoy_upstreams_http_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
@@ -97,6 +102,30 @@ func (i *cecTranslator) desiredEnvoyCluster(m *model.Model) ([]ciliumv2.XDSResou
 		}
 	}
 
+	for _, jwtURI := range getRemoteJWKSURIs(m) {
+		clusterName, err := getRemoteJWKSClusterName(jwtURI)
+		if err != nil {
+			continue
+		}
+		if _, exists := envoyClusters[clusterName]; exists {
+			continue
+		}
+		sortedClusterNames = append(sortedClusterNames, clusterName)
+		envoyClusters[clusterName], _ = i.remoteJWKSCluster(jwtURI)
+	}
+
+	for _, tokenURI := range getOIDCTokenEndpointURIs(m) {
+		clusterName, err := getOIDCTokenClusterName(tokenURI)
+		if err != nil {
+			continue
+		}
+		if _, exists := envoyClusters[clusterName]; exists {
+			continue
+		}
+		sortedClusterNames = append(sortedClusterNames, clusterName)
+		envoyClusters[clusterName], _ = i.remoteOIDCTokenCluster(tokenURI)
+	}
+
 	for ns, v := range getNamespaceNamePortsMapForTLS(m) {
 		for name, ports := range v {
 			for _, port := range ports {
@@ -115,6 +144,192 @@ func (i *cecTranslator) desiredEnvoyCluster(m *model.Model) ([]ciliumv2.XDSResou
 	}
 
 	return res, nil
+}
+
+func (i *cecTranslator) remoteJWKSCluster(uri string) (ciliumv2.XDSResource, error) {
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return ciliumv2.XDSResource{}, err
+	}
+
+	host := parsed.Hostname()
+	if host == "" {
+		return ciliumv2.XDSResource{}, fmt.Errorf("jwks uri missing host")
+	}
+
+	port := parsed.Port()
+	if port == "" {
+		switch strings.ToLower(parsed.Scheme) {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		default:
+			return ciliumv2.XDSResource{}, fmt.Errorf("unsupported jwks uri scheme %q", parsed.Scheme)
+		}
+	}
+
+	clusterName, err := getRemoteJWKSClusterName(uri)
+	if err != nil {
+		return ciliumv2.XDSResource{}, err
+	}
+
+	portValue, err := strconv.Atoi(port)
+	if err != nil {
+		return ciliumv2.XDSResource{}, err
+	}
+
+	cluster := &envoy_config_cluster_v3.Cluster{
+		Name: clusterName,
+		TypedExtensionProtocolOptions: map[string]*anypb.Any{
+			httpProtocolOptionsType: toAny(&envoy_upstreams_http_v3.HttpProtocolOptions{
+				UpstreamProtocolOptions: &envoy_upstreams_http_v3.HttpProtocolOptions_ExplicitHttpConfig_{
+					ExplicitHttpConfig: &envoy_upstreams_http_v3.HttpProtocolOptions_ExplicitHttpConfig{
+						ProtocolConfig: &envoy_upstreams_http_v3.HttpProtocolOptions_ExplicitHttpConfig_HttpProtocolOptions{},
+					},
+				},
+			}),
+		},
+		ClusterDiscoveryType: &envoy_config_cluster_v3.Cluster_Type{
+			Type: envoy_config_cluster_v3.Cluster_LOGICAL_DNS,
+		},
+		LoadAssignment: &envoy_config_endpoint_v3.ClusterLoadAssignment{
+			ClusterName: clusterName,
+			Endpoints: []*envoy_config_endpoint_v3.LocalityLbEndpoints{{
+				LbEndpoints: []*envoy_config_endpoint_v3.LbEndpoint{{
+					HostIdentifier: &envoy_config_endpoint_v3.LbEndpoint_Endpoint{
+						Endpoint: &envoy_config_endpoint_v3.Endpoint{
+							Address: &envoy_config_core_v3.Address{
+								Address: &envoy_config_core_v3.Address_SocketAddress{
+									SocketAddress: &envoy_config_core_v3.SocketAddress{
+										Protocol: envoy_config_core_v3.SocketAddress_TCP,
+										Address:  host,
+										PortSpecifier: &envoy_config_core_v3.SocketAddress_PortValue{
+											PortValue: uint32(portValue),
+										},
+									},
+								},
+							},
+						},
+					},
+				}},
+			}},
+		},
+	}
+
+	for _, fn := range []ClusterMutator{
+		withConnectionTimeout(10),
+		withClusterLbPolicy(int32(envoy_config_cluster_v3.Cluster_ROUND_ROBIN)),
+		withOutlierDetection(true),
+	} {
+		cluster = fn(cluster)
+	}
+
+	if strings.EqualFold(parsed.Scheme, "https") {
+		cluster.TransportSocket = &envoy_config_core_v3.TransportSocket{
+			Name: "envoy.transport_sockets.tls",
+			ConfigType: &envoy_config_core_v3.TransportSocket_TypedConfig{
+				TypedConfig: toAny(&envoy_config_tls_v3.UpstreamTlsContext{
+					Sni: host,
+				}),
+			},
+		}
+	}
+
+	return toXdsResource(cluster, envoy.ClusterTypeURL)
+}
+
+func (i *cecTranslator) remoteOIDCTokenCluster(uri string) (ciliumv2.XDSResource, error) {
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return ciliumv2.XDSResource{}, err
+	}
+
+	host := parsed.Hostname()
+	if host == "" {
+		return ciliumv2.XDSResource{}, fmt.Errorf("oidc token uri missing host")
+	}
+
+	port := parsed.Port()
+	if port == "" {
+		switch strings.ToLower(parsed.Scheme) {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		default:
+			return ciliumv2.XDSResource{}, fmt.Errorf("unsupported oidc token uri scheme %q", parsed.Scheme)
+		}
+	}
+
+	clusterName, err := getOIDCTokenClusterName(uri)
+	if err != nil {
+		return ciliumv2.XDSResource{}, err
+	}
+
+	portValue, err := strconv.Atoi(port)
+	if err != nil {
+		return ciliumv2.XDSResource{}, err
+	}
+
+	cluster := &envoy_config_cluster_v3.Cluster{
+		Name: clusterName,
+		TypedExtensionProtocolOptions: map[string]*anypb.Any{
+			httpProtocolOptionsType: toAny(&envoy_upstreams_http_v3.HttpProtocolOptions{
+				UpstreamProtocolOptions: &envoy_upstreams_http_v3.HttpProtocolOptions_ExplicitHttpConfig_{
+					ExplicitHttpConfig: &envoy_upstreams_http_v3.HttpProtocolOptions_ExplicitHttpConfig{
+						ProtocolConfig: &envoy_upstreams_http_v3.HttpProtocolOptions_ExplicitHttpConfig_HttpProtocolOptions{},
+					},
+				},
+			}),
+		},
+		ClusterDiscoveryType: &envoy_config_cluster_v3.Cluster_Type{
+			Type: envoy_config_cluster_v3.Cluster_LOGICAL_DNS,
+		},
+		LoadAssignment: &envoy_config_endpoint_v3.ClusterLoadAssignment{
+			ClusterName: clusterName,
+			Endpoints: []*envoy_config_endpoint_v3.LocalityLbEndpoints{{
+				LbEndpoints: []*envoy_config_endpoint_v3.LbEndpoint{{
+					HostIdentifier: &envoy_config_endpoint_v3.LbEndpoint_Endpoint{
+						Endpoint: &envoy_config_endpoint_v3.Endpoint{
+							Address: &envoy_config_core_v3.Address{
+								Address: &envoy_config_core_v3.Address_SocketAddress{
+									SocketAddress: &envoy_config_core_v3.SocketAddress{
+										Protocol: envoy_config_core_v3.SocketAddress_TCP,
+										Address:  host,
+										PortSpecifier: &envoy_config_core_v3.SocketAddress_PortValue{
+											PortValue: uint32(portValue),
+										},
+									},
+								},
+							},
+						},
+					},
+				}},
+			}},
+		},
+	}
+
+	for _, fn := range []ClusterMutator{
+		withConnectionTimeout(10),
+		withClusterLbPolicy(int32(envoy_config_cluster_v3.Cluster_ROUND_ROBIN)),
+		withOutlierDetection(true),
+	} {
+		cluster = fn(cluster)
+	}
+
+	if strings.EqualFold(parsed.Scheme, "https") {
+		cluster.TransportSocket = &envoy_config_core_v3.TransportSocket{
+			Name: "envoy.transport_sockets.tls",
+			ConfigType: &envoy_config_core_v3.TransportSocket_TypedConfig{
+				TypedConfig: toAny(&envoy_config_tls_v3.UpstreamTlsContext{
+					Sni: host,
+				}),
+			},
+		}
+	}
+
+	return toXdsResource(cluster, envoy.ClusterTypeURL)
 }
 
 // httpCluster creates a new Envoy cluster.
@@ -253,6 +468,38 @@ func getGRPCExtAuthBackends(m *model.Model) []model.Backend {
 		}
 	}
 	return result
+}
+
+func getRemoteJWKSURIs(m *model.Model) []string {
+	seen := map[string]bool{}
+	var uris []string
+	for _, policy := range getGatewayJWTPolicies(m) {
+		if policy.JWT == nil || policy.JWT.RemoteJWKSURI == "" {
+			continue
+		}
+		if seen[policy.JWT.RemoteJWKSURI] {
+			continue
+		}
+		seen[policy.JWT.RemoteJWKSURI] = true
+		uris = append(uris, policy.JWT.RemoteJWKSURI)
+	}
+	return uris
+}
+
+func getOIDCTokenEndpointURIs(m *model.Model) []string {
+	seen := map[string]bool{}
+	var uris []string
+	for _, policy := range getGatewayOIDCPolicies(m) {
+		if policy.OIDC == nil || policy.OIDC.Endpoints == nil || policy.OIDC.Endpoints.Token == "" {
+			continue
+		}
+		if seen[policy.OIDC.Endpoints.Token] {
+			continue
+		}
+		seen[policy.OIDC.Endpoints.Token] = true
+		uris = append(uris, policy.OIDC.Endpoints.Token)
+	}
+	return uris
 }
 
 // getNamespaceNamePortsMapFroTLS returns a map of namespace -> name -> ports.

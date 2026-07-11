@@ -1095,6 +1095,9 @@ gatewayAPI:
   # -- Enable support for Gateway API in cilium
   # This will automatically set enable-envoy-config as well.
   enabled: false
+  authPolicy:
+    # -- Enable the alpha CiliumGatewayAuthPolicy CRD and controller support for native Gateway API auth policies.
+    enabled: false
   # -- Enable proxy protocol for all GatewayAPI listeners. Note that _only_ Proxy protocol traffic will be accepted once this is enabled.
   enableProxyProtocol: false
   # @schema

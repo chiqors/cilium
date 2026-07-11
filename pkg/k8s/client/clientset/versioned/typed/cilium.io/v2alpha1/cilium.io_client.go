@@ -23,6 +23,7 @@ type CiliumV2alpha1Interface interface {
 	CiliumCIDRGroupsGetter
 	CiliumDatapathPluginsGetter
 	CiliumEndpointSlicesGetter
+	CiliumGatewayAuthPoliciesGetter
 	CiliumGatewayClassConfigsGetter
 	CiliumL2AnnouncementPoliciesGetter
 	CiliumLoadBalancerIPPoolsGetter
@@ -64,6 +65,10 @@ func (c *CiliumV2alpha1Client) CiliumDatapathPlugins() CiliumDatapathPluginInter
 
 func (c *CiliumV2alpha1Client) CiliumEndpointSlices() CiliumEndpointSliceInterface {
 	return newCiliumEndpointSlices(c)
+}
+
+func (c *CiliumV2alpha1Client) CiliumGatewayAuthPolicies(namespace string) CiliumGatewayAuthPolicyInterface {
+	return newCiliumGatewayAuthPolicies(c, namespace)
 }
 
 func (c *CiliumV2alpha1Client) CiliumGatewayClassConfigs(namespace string) CiliumGatewayClassConfigInterface {

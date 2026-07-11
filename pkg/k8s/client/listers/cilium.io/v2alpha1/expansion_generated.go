@@ -37,6 +37,14 @@ type CiliumDatapathPluginListerExpansion interface{}
 // CiliumEndpointSliceLister.
 type CiliumEndpointSliceListerExpansion interface{}
 
+// CiliumGatewayAuthPolicyListerExpansion allows custom methods to be added to
+// CiliumGatewayAuthPolicyLister.
+type CiliumGatewayAuthPolicyListerExpansion interface{}
+
+// CiliumGatewayAuthPolicyNamespaceListerExpansion allows custom methods to be added to
+// CiliumGatewayAuthPolicyNamespaceLister.
+type CiliumGatewayAuthPolicyNamespaceListerExpansion interface{}
+
 // CiliumGatewayClassConfigListerExpansion allows custom methods to be added to
 // CiliumGatewayClassConfigLister.
 type CiliumGatewayClassConfigListerExpansion interface{}

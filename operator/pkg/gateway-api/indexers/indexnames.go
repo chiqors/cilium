@@ -31,6 +31,21 @@ const (
 	// Indexes BackendTLSPolicies by all the ConfigMaps referenced in the object.
 	BackendTLSPolicyConfigMapIndex = "backendTLSPolicyConfigMaps"
 
+	// Indexes CiliumGatewayAuthPolicies by all referenced Secrets.
+	GatewayAuthPolicySecretIndex = "gatewayAuthPolicySecrets"
+
+	// Indexes CiliumGatewayAuthPolicies by all referenced ConfigMaps.
+	GatewayAuthPolicyConfigMapIndex = "gatewayAuthPolicyConfigMaps"
+
+	// Indexes CiliumGatewayAuthPolicies by targeted Gateways.
+	GatewayAuthPolicyGatewayTargetIndex = "gatewayAuthPolicyGatewayTargets"
+
+	// Indexes CiliumGatewayAuthPolicies by targeted HTTPRoutes.
+	GatewayAuthPolicyHTTPRouteTargetIndex = "gatewayAuthPolicyHTTPRouteTargets"
+
+	// Indexes CiliumGatewayAuthPolicies by targeted GRPCRoutes.
+	GatewayAuthPolicyGRPCRouteTargetIndex = "gatewayAuthPolicyGRPCRouteTargets"
+
 	// Indexes GAMMA HTTPRoutes by all the GAMMA parents of that HTTPRoute.
 	// This is then be used by the Service reconciler to only retrieve any HTTPRoutes that have that specific
 	// Service as a parent.

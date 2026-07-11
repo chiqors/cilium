@@ -40,6 +40,7 @@ CRDS_CILIUM_V2ALPHA1="ciliumendpointslices \
                       ciliuml2announcementpolicies \
                       ciliumpodippools \
                       ciliumgatewayclassconfigs \
+                      ciliumgatewayauthpolicies \
                       ciliumdatapathplugins"
 
 TMPDIR=$(mktemp -d -t cilium.tmpXXXXXXXX)

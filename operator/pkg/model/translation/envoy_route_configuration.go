@@ -139,6 +139,7 @@ func (i *cecTranslator) desiredEnvoyHTTPRouteConfiguration(m *model.Model) ([]ci
 						}
 						redirectedHost[h.hostname] = struct{}{}
 						vhs := i.desiredVirtualHost(hostNamePortRoutes[h.hostname][httpsPort], VirtualHostParameter{
+							Model:          m,
 							HostNames:      []string{h.hostname},
 							HTTPSRedirect:  true,
 							ListenerPort:   m.HTTP[0].Port,
@@ -160,6 +161,7 @@ func (i *cecTranslator) desiredEnvoyHTTPRouteConfiguration(m *model.Model) ([]ci
 				continue
 			}
 			vhs := i.desiredVirtualHost(routes, VirtualHostParameter{
+				Model:          m,
 				HostNames:      []string{h.hostname},
 				HTTPSRedirect:  false,
 				ListenerPort:   m.HTTP[0].Port,

@@ -263,6 +263,73 @@ func Test_getGRPCExtAuthBackends(t *testing.T) {
 	require.Equal(t, "grpc-svc", backends[0].Name)
 }
 
+func Test_desiredEnvoyCluster_remoteJWKS(t *testing.T) {
+	m := &model.Model{
+		HTTP: []model.HTTPListener{{
+			Routes: []model.HTTPRoute{{GatewayAuthPolicy: "default/jwt"}},
+		}},
+		GatewayAuth: &model.GatewayAuthModel{
+			Policies: []model.GatewayAuthPolicy{{
+				Source: model.FullyQualifiedResource{Name: "jwt", Namespace: "default"},
+				JWT: &model.GatewayJWTAuth{
+					Issuer:        "https://issuer.example.com",
+					RemoteJWKSURI: "https://issuer.example.com/.well-known/jwks.json",
+				},
+			}},
+		},
+	}
+
+	c := &cecTranslator{}
+	clusters, err := c.desiredEnvoyCluster(m)
+	require.NoError(t, err)
+	require.Len(t, clusters, 1)
+
+	cluster := &envoy_config_cluster_v3.Cluster{}
+	require.NoError(t, proto.Unmarshal(clusters[0].Value, cluster))
+	require.Equal(t, "jwt:https:issuer.example.com:443", cluster.Name)
+	require.Equal(t, envoy_config_cluster_v3.Cluster_LOGICAL_DNS, cluster.GetType())
+	require.NotNil(t, cluster.GetLoadAssignment())
+	require.Equal(t, "issuer.example.com", cluster.GetLoadAssignment().GetEndpoints()[0].GetLbEndpoints()[0].GetEndpoint().GetAddress().GetSocketAddress().GetAddress())
+	require.Equal(t, uint32(443), cluster.GetLoadAssignment().GetEndpoints()[0].GetLbEndpoints()[0].GetEndpoint().GetAddress().GetSocketAddress().GetPortValue())
+	require.NotNil(t, cluster.TransportSocket)
+	require.Equal(t, "envoy.transport_sockets.tls", cluster.TransportSocket.Name)
+
+	tlsCtx := &envoy_config_tls.UpstreamTlsContext{}
+	require.NoError(t, proto.Unmarshal(cluster.TransportSocket.GetTypedConfig().GetValue(), tlsCtx))
+	require.Equal(t, "issuer.example.com", tlsCtx.Sni)
+}
+
+func Test_desiredEnvoyCluster_oidcTokenEndpoint(t *testing.T) {
+	m := &model.Model{
+		HTTP: []model.HTTPListener{{Routes: []model.HTTPRoute{{GatewayAuthPolicy: "default/oidc"}}}},
+		GatewayAuth: &model.GatewayAuthModel{
+			Policies: []model.GatewayAuthPolicy{{
+				Source: model.FullyQualifiedResource{Name: "oidc", Namespace: "default"},
+				OIDC: &model.GatewayOIDCAuth{
+					ClientID:     "client-id",
+					ClientSecret: model.GatewayAuthSecretRef{Name: "client", Found: true},
+					CookieSecret: model.GatewayAuthSecretRef{Name: "cookie", Found: true},
+					Endpoints: &model.GatewayOIDCEndpoints{
+						Authorization: "https://issuer.example.com/authorize",
+						Token:         "https://issuer.example.com/token",
+					},
+				},
+			}},
+		},
+	}
+
+	c := &cecTranslator{}
+	clusters, err := c.desiredEnvoyCluster(m)
+	require.NoError(t, err)
+	require.Len(t, clusters, 1)
+
+	cluster := &envoy_config_cluster_v3.Cluster{}
+	require.NoError(t, proto.Unmarshal(clusters[0].Value, cluster))
+	require.Equal(t, "oidc:https:issuer.example.com:443", cluster.Name)
+	require.Equal(t, envoy_config_cluster_v3.Cluster_LOGICAL_DNS, cluster.GetType())
+	require.Equal(t, "issuer.example.com", cluster.GetLoadAssignment().GetEndpoints()[0].GetLbEndpoints()[0].GetEndpoint().GetAddress().GetSocketAddress().GetAddress())
+}
+
 func Test_getHTTPExtAuthBackends(t *testing.T) {
 	grpcBe := extAuthBackend("ns", "grpc-svc", 8080, nil)
 	httpBe := extAuthBackend("ns", "http-svc", 8081, nil)

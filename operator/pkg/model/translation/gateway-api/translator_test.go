@@ -9,9 +9,19 @@ import (
 	"strings"
 	"testing"
 
+	envoy_config_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	envoy_config_listener_v3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	envoy_config_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	basicauthv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/basic_auth/v3"
+	jwtauthnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
+	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
+	oauth2v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/oauth2/v3"
+	rbacv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
+	httpConnectionManagerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -117,6 +127,233 @@ func Test_translator_Translate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_translator_Translate_GatewayAuthResources(t *testing.T) {
+	cfg := translation.Config{
+		SecretsNamespace: "cilium-secrets",
+		RouteConfig: translation.RouteConfig{
+			HostNameSuffixMatch: true,
+		},
+		ListenerConfig: translation.ListenerConfig{
+			StreamIdleTimeoutSeconds: 300,
+		},
+		ClusterConfig: translation.ClusterConfig{
+			IdleTimeoutSeconds: 60,
+		},
+		IPConfig: translation.IPConfig{
+			IPv4Enabled: true,
+			IPv6Enabled: true,
+		},
+		OriginalIPDetectionConfig: translation.OriginalIPDetectionConfig{
+			UseRemoteAddress:  true,
+			XFFNumTrustedHops: 0,
+		},
+	}
+	trans := &gatewayAPITranslator{
+		cecTranslator: translation.NewCECTranslator(cfg),
+	}
+
+	input := &model.Model{
+		HTTP: []model.HTTPListener{{
+			Name:     "prod-web-gw",
+			Port:     80,
+			Hostname: "*",
+			Routes: []model.HTTPRoute{
+				{
+					Hostnames:         []string{"*"},
+					PathMatch:         model.StringMatch{Prefix: "/basic"},
+					Backends:          []model.Backend{{Name: "my-service", Namespace: "default", Port: &model.BackendPort{Port: 8080}}},
+					GatewayAuthPolicy: "default/basic",
+					Timeout:           model.Timeout{},
+				},
+				{
+					Hostnames:         []string{"*"},
+					PathMatch:         model.StringMatch{Prefix: "/apikey"},
+					Backends:          []model.Backend{{Name: "my-service", Namespace: "default", Port: &model.BackendPort{Port: 8080}}},
+					GatewayAuthPolicy: "default/api-key",
+					Timeout:           model.Timeout{},
+				},
+				{
+					Hostnames:         []string{"*"},
+					PathMatch:         model.StringMatch{Prefix: "/oidc"},
+					Backends:          []model.Backend{{Name: "my-service", Namespace: "default", Port: &model.BackendPort{Port: 8080}}},
+					GatewayAuthPolicy: "default/oidc",
+					Timeout:           model.Timeout{},
+				},
+				{
+					Hostnames:         []string{"*"},
+					PathMatch:         model.StringMatch{Prefix: "/jwt"},
+					Backends:          []model.Backend{{Name: "my-service", Namespace: "default", Port: &model.BackendPort{Port: 8080}}},
+					GatewayAuthPolicy: "default/jwt-authz",
+					Timeout:           model.Timeout{},
+				},
+				{
+					Hostnames: []string{"*"},
+					PathMatch: model.StringMatch{Prefix: "/open"},
+					Backends:  []model.Backend{{Name: "my-service", Namespace: "default", Port: &model.BackendPort{Port: 8080}}},
+					Timeout:   model.Timeout{},
+				},
+			},
+			Service: &model.Service{
+				Type:                           "LoadBalancer",
+				LoadBalancerSourceRangesPolicy: "Allow",
+			},
+			Sources: []model.FullyQualifiedResource{{
+				Group:     gatewayv1.GroupName,
+				Version:   gatewayv1.GroupVersion.Version,
+				Kind:      "Gateway",
+				Name:      "my-gateway",
+				Namespace: "default",
+			}},
+		}},
+		GatewayAuth: &model.GatewayAuthModel{
+			Policies: []model.GatewayAuthPolicy{
+				{
+					Source: model.FullyQualifiedResource{Name: "basic", Namespace: "default"},
+					BasicAuth: &model.GatewayBasicAuth{
+						Secret: model.GatewayAuthSecretRef{Name: "basic-auth", Key: "auth", Found: true, Value: []byte("alice:$apr1$hash")},
+					},
+				},
+				{
+					Source: model.FullyQualifiedResource{Name: "api-key", Namespace: "default"},
+					APIKeyAuth: &model.GatewayAPIKeyAuth{
+						Sources:         []model.GatewayAPIKeySource{{Type: "Header", Name: "x-api-key"}},
+						Credentials:     []model.GatewayAPIKeyCredential{{Secret: model.GatewayAuthSecretRef{Name: "api-key", Key: "token", Found: true, Value: []byte("secret-a")}, Identity: "client-a"}},
+						IdentityHeader:  "x-identity",
+						StripCredential: true,
+					},
+				},
+				{
+					Source: model.FullyQualifiedResource{Name: "oidc", Namespace: "default"},
+					OIDC: &model.GatewayOIDCAuth{
+						Issuer:       "https://issuer.example.com",
+						ClientID:     "client-id",
+						ClientSecret: model.GatewayAuthSecretRef{Name: "oidc-client", Key: "client-secret", Found: true, Value: []byte("client-secret-value")},
+						CookieSecret: model.GatewayAuthSecretRef{Name: "oidc-cookie", Key: "cookie-secret", Found: true, Value: []byte("cookie-secret-value")},
+						Scopes:       []string{"openid"},
+						Endpoints: &model.GatewayOIDCEndpoints{
+							Authorization: "https://issuer.example.com/authorize",
+							Token:         "https://issuer.example.com/token",
+						},
+					},
+				},
+				{
+					Source: model.FullyQualifiedResource{Name: "jwt-authz", Namespace: "default"},
+					JWT: &model.GatewayJWTAuth{
+						Issuer:        "https://issuer.example.com",
+						Audiences:     []string{"aud-a"},
+						RemoteJWKSURI: "https://issuer.example.com/.well-known/jwks.json",
+					},
+					Authorization: &model.GatewayAuthorization{
+						Rules: []model.GatewayAuthorizationRule{{
+							Methods: []string{"GET"},
+							Paths:   []string{"/jwt"},
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	cec, svc, _, err := trans.Translate(input)
+	require.NoError(t, err)
+	require.NotNil(t, cec)
+	require.NotNil(t, svc)
+
+	var listener *httpConnectionManagerv3.HttpConnectionManager
+	var routeConfig *envoy_config_route_v3.RouteConfiguration
+	clusterNames := map[string]struct{}{}
+
+	for _, resource := range cec.Spec.Resources {
+		switch {
+		case strings.HasSuffix(resource.TypeUrl, "envoy.config.listener.v3.Listener"):
+			l := &envoy_config_listener_v3.Listener{}
+			require.NoError(t, proto.Unmarshal(resource.Value, l))
+			require.NotEmpty(t, l.GetFilterChains())
+			require.NotEmpty(t, l.GetFilterChains()[0].GetFilters())
+			listener = &httpConnectionManagerv3.HttpConnectionManager{}
+			require.NoError(t, proto.Unmarshal(l.GetFilterChains()[0].GetFilters()[0].GetTypedConfig().GetValue(), listener))
+		case strings.HasSuffix(resource.TypeUrl, "envoy.config.route.v3.RouteConfiguration"):
+			routeConfig = &envoy_config_route_v3.RouteConfiguration{}
+			require.NoError(t, proto.Unmarshal(resource.Value, routeConfig))
+		case strings.HasSuffix(resource.TypeUrl, "envoy.config.cluster.v3.Cluster"):
+			cluster := &envoy_config_cluster_v3.Cluster{}
+			require.NoError(t, proto.Unmarshal(resource.Value, cluster))
+			clusterNames[cluster.Name] = struct{}{}
+		}
+	}
+
+	require.NotNil(t, listener)
+	require.NotNil(t, routeConfig)
+	require.Equal(t, []string{
+		"envoy.filters.http.grpc_web",
+		"envoy.filters.http.grpc_stats",
+		"envoy.filters.http.basic_auth/default",
+		translation.APIKeyAuthFilterName,
+		"envoy.filters.http.oauth2/default/oidc",
+		translation.JWTAuthFilterName,
+		translation.GatewayAuthorizationFilterName,
+		"envoy.filters.http.router",
+	}, httpFilterNames(listener.GetHttpFilters()))
+
+	require.Contains(t, clusterNames, "default:my-service:8080")
+	require.Contains(t, clusterNames, "jwt:https:issuer.example.com:443")
+	require.Contains(t, clusterNames, "oidc:https:issuer.example.com:443")
+
+	require.Len(t, routeConfig.GetVirtualHosts(), 1)
+	routesByPrefix := map[string]*envoy_config_route_v3.Route{}
+	for _, route := range routeConfig.GetVirtualHosts()[0].GetRoutes() {
+		routesByPrefix[route.GetMatch().GetPathSeparatedPrefix()] = route
+	}
+
+	basicRoute := routesByPrefix["/basic"]
+	require.NotNil(t, basicRoute)
+	basicPerRoute := &basicauthv3.BasicAuthPerRoute{}
+	require.NoError(t, proto.Unmarshal(basicRoute.GetTypedPerFilterConfig()["envoy.filters.http.basic_auth/default"].GetValue(), basicPerRoute))
+	require.Equal(t, "alice:$apr1$hash", basicPerRoute.GetUsers().GetInlineString())
+
+	apiKeyRoute := routesByPrefix["/apikey"]
+	require.NotNil(t, apiKeyRoute)
+	apiKeyPerRoute := &luav3.LuaPerRoute{}
+	require.NoError(t, proto.Unmarshal(apiKeyRoute.GetTypedPerFilterConfig()[translation.APIKeyAuthFilterName].GetValue(), apiKeyPerRoute))
+	require.Equal(t, "x-identity", apiKeyPerRoute.GetFilterContext().GetFields()["identity_header"].GetStringValue())
+
+	oidcRoute := routesByPrefix["/oidc"]
+	require.NotNil(t, oidcRoute)
+	_, hasSelectedOIDCOverride := oidcRoute.GetTypedPerFilterConfig()["envoy.filters.http.oauth2/default/oidc"]
+	require.False(t, hasSelectedOIDCOverride)
+
+	jwtRoute := routesByPrefix["/jwt"]
+	require.NotNil(t, jwtRoute)
+	jwtPerRoute := &jwtauthnv3.PerRouteConfig{}
+	require.NoError(t, proto.Unmarshal(jwtRoute.GetTypedPerFilterConfig()[translation.JWTAuthFilterName].GetValue(), jwtPerRoute))
+	require.Equal(t, "default/jwt-authz", jwtPerRoute.GetRequirementName())
+	rbacPerRoute := &rbacv3.RBACPerRoute{}
+	require.NoError(t, proto.Unmarshal(jwtRoute.GetTypedPerFilterConfig()[translation.GatewayAuthorizationFilterName].GetValue(), rbacPerRoute))
+	require.NotNil(t, rbacPerRoute.GetRbac())
+	require.Contains(t, rbacPerRoute.GetRbac().GetRules().GetPolicies(), "rule-0")
+
+	openRoute := routesByPrefix["/open"]
+	require.NotNil(t, openRoute)
+	openJWTPerRoute := &jwtauthnv3.PerRouteConfig{}
+	require.NoError(t, proto.Unmarshal(openRoute.GetTypedPerFilterConfig()[translation.JWTAuthFilterName].GetValue(), openJWTPerRoute))
+	require.True(t, openJWTPerRoute.GetDisabled())
+	openRBACPerRoute := &rbacv3.RBACPerRoute{}
+	require.NoError(t, proto.Unmarshal(openRoute.GetTypedPerFilterConfig()[translation.GatewayAuthorizationFilterName].GetValue(), openRBACPerRoute))
+	require.Nil(t, openRBACPerRoute.GetRbac())
+
+	oauth2Filter := &oauth2v3.OAuth2{}
+	require.NoError(t, proto.Unmarshal(listener.GetHttpFilters()[4].GetTypedConfig().GetValue(), oauth2Filter))
+	require.Equal(t, "client-id", oauth2Filter.GetConfig().GetCredentials().GetClientId())
+}
+
+func httpFilterNames(filters []*httpConnectionManagerv3.HttpFilter) []string {
+	names := make([]string, 0, len(filters))
+	for _, filter := range filters {
+		names = append(names, filter.Name)
+	}
+	return names
 }
 
 func Test_translator_Translate_HostNetwork(t *testing.T) {

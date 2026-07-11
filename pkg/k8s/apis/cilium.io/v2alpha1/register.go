@@ -90,6 +90,12 @@ const (
 	CGCCKindDefinition = "CiliumGatewayClassConfig"
 	CGCCName           = CGCCPluralName + "." + CustomResourceDefinitionGroup
 
+	// CiliumGatewayAuthPolicy (CGAP)
+	CGAPPluralName     = "ciliumgatewayauthpolicies"
+	CGAPListName       = "ciliumgatewayauthpolicylists"
+	CGAPKindDefinition = "CiliumGatewayAuthPolicy"
+	CGAPName           = CGAPPluralName + "." + CustomResourceDefinitionGroup
+
 	CDPPPluralName     = "ciliumdatapathplugins"
 	CDPPKindDefinition = "CiliumDatapathPlugin"
 	CDPPName           = CDPPPluralName + "." + CustomResourceDefinitionGroup
@@ -159,6 +165,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		// new Gateway API types
 		&CiliumGatewayClassConfig{},
 		&CiliumGatewayClassConfigList{},
+		&CiliumGatewayAuthPolicy{},
+		&CiliumGatewayAuthPolicyList{},
 
 		&CiliumDatapathPlugin{},
 	)

@@ -10,8 +10,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
+	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -335,27 +338,62 @@ func (r *gatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	tcpRoutes := r.filterTCPRoutesByGateway(ctx, gw, attachedListenerSets, tcpRouteList.Items)
 	udpRoutes := r.filterUDPRoutesByGateway(ctx, gw, attachedListenerSets, udpRouteList.Items)
 
+	var authPolicies []v2alpha1.CiliumGatewayAuthPolicy
+	var authPolicyAttachments *helpers.CiliumGatewayAuthPolicyAttachments
+	var authPolicySecrets map[types.NamespacedName]corev1.Secret
+	var authPolicyConfigMaps map[types.NamespacedName]corev1.ConfigMap
+	var authPolicyOIDCMetadata map[types.NamespacedName]model.GatewayOIDCEndpoints
+	if r.enableGatewayAPIAuthPolicy {
+		authPolicies, err = r.getGatewayAuthPoliciesForGateway(ctx, gw, httpRoutes, grpcRoutes)
+		if err != nil {
+			scopedLog.ErrorContext(ctx, "Unable to list CiliumGatewayAuthPolicies", logfields.Error, err)
+			return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
+		}
+		authPolicyAttachments = helpers.ResolveCiliumGatewayAuthPolicyAttachments(gw, httpRoutes, grpcRoutes, authPolicies)
+		authPolicySecrets, authPolicyConfigMaps, err = r.getGatewayAuthPolicyReferencedObjects(ctx, authPolicies)
+		if err != nil {
+			scopedLog.ErrorContext(ctx, "Unable to resolve CiliumGatewayAuthPolicy references", logfields.Error, err)
+			return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
+		}
+		authPolicyOIDCMetadata, err = r.resolveGatewayAuthPolicyOIDCMetadata(ctx, authPolicies)
+		if err != nil {
+			scopedLog.ErrorContext(ctx, "Unable to resolve CiliumGatewayAuthPolicy OIDC metadata", logfields.Error, err)
+			return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
+		}
+	}
+
 	if err := r.setBackendTLSPolicyStatuses(scopedLog, ctx, httpRoutes, btlspMap, req.NamespacedName); err != nil {
 		scopedLog.ErrorContext(ctx, "Unable to update BackendTLSPolicy Status", logfields.Error, err)
 		return controllerruntime.Fail(err)
 	}
 
 	m := ingestion.GatewayAPI(scopedLog, ingestion.Input{
-		GatewayClass:        *gwc,
-		GatewayClassConfig:  r.getGatewayClassConfig(ctx, gwc),
-		Gateway:             *gw,
-		HTTPRoutes:          httpRoutes,
-		TLSRoutes:           tlsRoutes,
-		GRPCRoutes:          grpcRoutes,
-		TCPRoutes:           tcpRoutes,
-		UDPRoutes:           udpRoutes,
-		Namespaces:          namespaces,
-		Services:            servicesList.Items,
-		ServiceImports:      serviceImportsList.Items,
-		ReferenceGrants:     grants.Items,
-		BackendTLSPolicyMap: btlspMap,
-		MergedListeners:     mergedListeners,
+		GatewayClass:           *gwc,
+		GatewayClassConfig:     r.getGatewayClassConfig(ctx, gwc),
+		Gateway:                *gw,
+		HTTPRoutes:             httpRoutes,
+		TLSRoutes:              tlsRoutes,
+		GRPCRoutes:             grpcRoutes,
+		TCPRoutes:              tcpRoutes,
+		UDPRoutes:              udpRoutes,
+		Namespaces:             namespaces,
+		Services:               servicesList.Items,
+		ServiceImports:         serviceImportsList.Items,
+		ReferenceGrants:        grants.Items,
+		BackendTLSPolicyMap:    btlspMap,
+		MergedListeners:        mergedListeners,
+		AuthPolicyAttachments:  authPolicyAttachments,
+		AuthPolicySecrets:      authPolicySecrets,
+		AuthPolicyConfigMaps:   authPolicyConfigMaps,
+		AuthPolicyOIDCMetadata: authPolicyOIDCMetadata,
 	})
+
+	if r.enableGatewayAPIAuthPolicy {
+		if err := r.setGatewayAuthPolicyStatuses(scopedLog, ctx, authPolicies, m.GatewayAuth, req.NamespacedName); err != nil {
+			scopedLog.ErrorContext(ctx, "Unable to update CiliumGatewayAuthPolicy Status", logfields.Error, err)
+			return controllerruntime.Fail(err)
+		}
+	}
 
 	listenersStatus, err := r.setListenerStatus(ctx, gw, httpRouteList, tlsRouteList, grpcRouteList, tcpRouteList, udpRouteList, namespaceLabels)
 	if err != nil {
@@ -440,6 +478,136 @@ func (r *gatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	scopedLog.InfoContext(ctx, "Successfully reconciled Gateway")
 	return controllerruntime.Success()
+}
+
+func (r *gatewayReconciler) getGatewayAuthPoliciesForGateway(
+	ctx context.Context,
+	gw *gatewayv1.Gateway,
+	httpRoutes []gatewayv1.HTTPRoute,
+	grpcRoutes []gatewayv1.GRPCRoute,
+) ([]v2alpha1.CiliumGatewayAuthPolicy, error) {
+	policiesByKey := make(map[types.NamespacedName]v2alpha1.CiliumGatewayAuthPolicy)
+
+	appendPolicies := func(list *v2alpha1.CiliumGatewayAuthPolicyList) {
+		for i := range list.Items {
+			policy := list.Items[i]
+			policiesByKey[client.ObjectKeyFromObject(&policy)] = policy
+		}
+	}
+
+	gatewayPolicies := &v2alpha1.CiliumGatewayAuthPolicyList{}
+	if err := r.Client.List(ctx, gatewayPolicies, &client.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector(indexers.GatewayAuthPolicyGatewayTargetIndex, client.ObjectKeyFromObject(gw).String()),
+	}); err != nil {
+		return nil, err
+	}
+	appendPolicies(gatewayPolicies)
+
+	for i := range httpRoutes {
+		routePolicies := &v2alpha1.CiliumGatewayAuthPolicyList{}
+		if err := r.Client.List(ctx, routePolicies, &client.ListOptions{
+			FieldSelector: fields.OneTermEqualSelector(indexers.GatewayAuthPolicyHTTPRouteTargetIndex, client.ObjectKeyFromObject(&httpRoutes[i]).String()),
+		}); err != nil {
+			return nil, err
+		}
+		appendPolicies(routePolicies)
+	}
+
+	for i := range grpcRoutes {
+		routePolicies := &v2alpha1.CiliumGatewayAuthPolicyList{}
+		if err := r.Client.List(ctx, routePolicies, &client.ListOptions{
+			FieldSelector: fields.OneTermEqualSelector(indexers.GatewayAuthPolicyGRPCRouteTargetIndex, client.ObjectKeyFromObject(&grpcRoutes[i]).String()),
+		}); err != nil {
+			return nil, err
+		}
+		appendPolicies(routePolicies)
+	}
+
+	policies := make([]v2alpha1.CiliumGatewayAuthPolicy, 0, len(policiesByKey))
+	for _, policy := range policiesByKey {
+		policies = append(policies, policy)
+	}
+	sort.SliceStable(policies, func(i, j int) bool {
+		if policies[i].CreationTimestamp.Equal(&policies[j].CreationTimestamp) {
+			return client.ObjectKeyFromObject(&policies[i]).String() < client.ObjectKeyFromObject(&policies[j]).String()
+		}
+		return policies[i].CreationTimestamp.Before(&policies[j].CreationTimestamp)
+	})
+
+	return policies, nil
+}
+
+func (r *gatewayReconciler) getGatewayAuthPolicyReferencedObjects(
+	ctx context.Context,
+	policies []v2alpha1.CiliumGatewayAuthPolicy,
+) (map[types.NamespacedName]corev1.Secret, map[types.NamespacedName]corev1.ConfigMap, error) {
+	secretKeys := make(map[types.NamespacedName]struct{})
+	configMapKeys := make(map[types.NamespacedName]struct{})
+
+	addSecret := func(namespace string, ref v2alpha1.CiliumGatewaySecretKeyRef) {
+		if ref.Name == "" {
+			return
+		}
+		secretKeys[types.NamespacedName{Namespace: namespace, Name: ref.Name}] = struct{}{}
+	}
+	addConfigMap := func(namespace string, ref v2alpha1.CiliumGatewayConfigMapKeyRef) {
+		if ref.Name == "" {
+			return
+		}
+		configMapKeys[types.NamespacedName{Namespace: namespace, Name: ref.Name}] = struct{}{}
+	}
+
+	for i := range policies {
+		policy := &policies[i]
+		namespace := policy.GetNamespace()
+
+		if policy.Spec.BasicAuth != nil {
+			addSecret(namespace, policy.Spec.BasicAuth.Secret)
+		}
+		if policy.Spec.APIKeyAuth != nil {
+			for _, credential := range policy.Spec.APIKeyAuth.Credentials {
+				addSecret(namespace, credential.Secret)
+			}
+		}
+		if policy.Spec.JWT != nil && policy.Spec.JWT.LocalJWKS != nil {
+			if policy.Spec.JWT.LocalJWKS.Secret != nil {
+				addSecret(namespace, *policy.Spec.JWT.LocalJWKS.Secret)
+			}
+			if policy.Spec.JWT.LocalJWKS.ConfigMap != nil {
+				addConfigMap(namespace, *policy.Spec.JWT.LocalJWKS.ConfigMap)
+			}
+		}
+		if policy.Spec.OIDC != nil {
+			addSecret(namespace, policy.Spec.OIDC.ClientSecret)
+			addSecret(namespace, policy.Spec.OIDC.CookieSecret)
+		}
+	}
+
+	secrets := make(map[types.NamespacedName]corev1.Secret, len(secretKeys))
+	for key := range secretKeys {
+		secret := &corev1.Secret{}
+		if err := r.Client.Get(ctx, key, secret); err != nil {
+			if k8serrors.IsNotFound(err) {
+				continue
+			}
+			return nil, nil, err
+		}
+		secrets[key] = *secret
+	}
+
+	configMaps := make(map[types.NamespacedName]corev1.ConfigMap, len(configMapKeys))
+	for key := range configMapKeys {
+		configMap := &corev1.ConfigMap{}
+		if err := r.Client.Get(ctx, key, configMap); err != nil {
+			if k8serrors.IsNotFound(err) {
+				continue
+			}
+			return nil, nil, err
+		}
+		configMaps[key] = *configMap
+	}
+
+	return secrets, configMaps, nil
 }
 
 func hasAllowedRoutesNamespaceSelector(gw *gatewayv1.Gateway, attachedListenerSets []gatewayv1.ListenerSet) bool {
@@ -2359,6 +2527,195 @@ func (r *gatewayReconciler) updateBackendTLSPolicyStatus(ctx context.Context, sc
 		return nil
 	}
 	scopedLog.Debug("BackendTLSPolicy status", backendTLSPolicy, types.NamespacedName{Name: original.Name, Namespace: original.Namespace})
+	return r.Client.Status().Update(ctx, new)
+}
+
+func (r *gatewayReconciler) setGatewayAuthPolicyStatuses(
+	scopedLog *slog.Logger,
+	ctx context.Context,
+	authPolicies []v2alpha1.CiliumGatewayAuthPolicy,
+	authModel *model.GatewayAuthModel,
+	gatewayName types.NamespacedName,
+) error {
+	scopedLog.Debug("Updating CiliumGatewayAuthPolicy statuses for Gateway", policies, len(authPolicies))
+
+	currentGatewayRef := gatewayv1.ParentReference{
+		Group:     ptr.To[gatewayv1.Group]("gateway.networking.k8s.io"),
+		Kind:      ptr.To[gatewayv1.Kind]("Gateway"),
+		Namespace: (*gatewayv1.Namespace)(&gatewayName.Namespace),
+		Name:      gatewayv1.ObjectName(gatewayName.Name),
+	}
+
+	modelPoliciesBySource := make(map[types.NamespacedName][]model.GatewayAuthPolicy)
+	conflictsByLoser := make(map[types.NamespacedName]int)
+	if authModel != nil {
+		for _, policy := range authModel.Policies {
+			key := types.NamespacedName{Namespace: policy.Source.Namespace, Name: policy.Source.Name}
+			modelPoliciesBySource[key] = append(modelPoliciesBySource[key], policy)
+		}
+		for _, conflict := range authModel.Conflicts {
+			key := types.NamespacedName{Namespace: conflict.Loser.Namespace, Name: conflict.Loser.Name}
+			conflictsByLoser[key]++
+		}
+	}
+
+	for _, original := range authPolicies {
+		authPolicy := original.DeepCopy()
+		key := client.ObjectKeyFromObject(authPolicy)
+		modelPolicies := modelPoliciesBySource[key]
+		selectedCount := len(modelPolicies) - conflictsByLoser[key]
+		hasMissingRefs := false
+		for _, policy := range modelPolicies {
+			if gatewayAuthPolicyHasUnresolvedRefs(policy) {
+				hasMissingRefs = true
+				break
+			}
+		}
+
+		acceptedCondition := metav1.Condition{
+			Type:               string(gatewayv1.PolicyConditionAccepted),
+			ObservedGeneration: authPolicy.GetGeneration(),
+			LastTransitionTime: metav1.NewTime(time.Now()),
+		}
+		resolvedRefsCondition := metav1.Condition{
+			Type:               string(gatewayv1.RouteConditionResolvedRefs),
+			ObservedGeneration: authPolicy.GetGeneration(),
+			LastTransitionTime: metav1.NewTime(time.Now()),
+		}
+
+		switch {
+		case len(modelPolicies) == 0:
+			acceptedCondition.Status = metav1.ConditionFalse
+			acceptedCondition.Reason = string(gatewayv1.PolicyReasonTargetNotFound)
+			acceptedCondition.Message = "No valid attachment target or section exists for this Gateway ancestor"
+
+			resolvedRefsCondition.Status = metav1.ConditionFalse
+			resolvedRefsCondition.Reason = string(gatewayv1.PolicyReasonTargetNotFound)
+			resolvedRefsCondition.Message = acceptedCondition.Message
+		case selectedCount == 0:
+			acceptedCondition.Status = metav1.ConditionFalse
+			acceptedCondition.Reason = string(gatewayv1.PolicyReasonConflicted)
+			acceptedCondition.Message = "Policy conflicts with an older policy at the same attachment scope"
+
+			if hasMissingRefs {
+				resolvedRefsCondition.Status = metav1.ConditionFalse
+				resolvedRefsCondition.Reason = string(gatewayv1.PolicyReasonInvalid)
+				resolvedRefsCondition.Message = "One or more referenced Secrets or ConfigMaps could not be resolved"
+			} else {
+				resolvedRefsCondition.Status = metav1.ConditionTrue
+				resolvedRefsCondition.Reason = string(gatewayv1.RouteReasonResolvedRefs)
+				resolvedRefsCondition.Message = "Resolved references"
+			}
+		default:
+			acceptedCondition.Status = metav1.ConditionTrue
+			acceptedCondition.Reason = string(gatewayv1.PolicyReasonAccepted)
+			acceptedCondition.Message = "Accepted by Gateway auth policy resolution"
+
+			if hasMissingRefs {
+				resolvedRefsCondition.Status = metav1.ConditionFalse
+				resolvedRefsCondition.Reason = string(gatewayv1.PolicyReasonInvalid)
+				resolvedRefsCondition.Message = "One or more referenced Secrets or ConfigMaps could not be resolved"
+			} else {
+				resolvedRefsCondition.Status = metav1.ConditionTrue
+				resolvedRefsCondition.Reason = string(gatewayv1.RouteReasonResolvedRefs)
+				resolvedRefsCondition.Message = "Resolved references"
+			}
+		}
+
+		authPolicy.Status.Ancestors = mergeGatewayAuthPolicyAncestorStatus(
+			authPolicy.Status.Ancestors,
+			currentGatewayRef,
+			gatewayv1.GatewayController(r.controllerName),
+			acceptedCondition,
+			resolvedRefsCondition,
+		)
+
+		if err := r.updateGatewayAuthPolicyStatus(ctx, scopedLog, &original, authPolicy); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func gatewayAuthPolicyHasUnresolvedRefs(policy model.GatewayAuthPolicy) bool {
+	if policy.BasicAuth != nil && (!policy.BasicAuth.Secret.Found || len(policy.BasicAuth.Secret.Value) == 0) {
+		return true
+	}
+	if policy.APIKeyAuth != nil {
+		for _, credential := range policy.APIKeyAuth.Credentials {
+			if !credential.Secret.Found {
+				return true
+			}
+		}
+	}
+	if policy.JWT != nil && policy.JWT.LocalJWKS != nil {
+		if policy.JWT.LocalJWKS.Secret != nil && (!policy.JWT.LocalJWKS.Secret.Found || len(policy.JWT.LocalJWKS.Secret.Value) == 0) {
+			return true
+		}
+		if policy.JWT.LocalJWKS.ConfigMap != nil && (!policy.JWT.LocalJWKS.ConfigMap.Found || len(policy.JWT.LocalJWKS.ConfigMap.Value) == 0) {
+			return true
+		}
+	}
+	if policy.JWT != nil && policy.JWT.RemoteJWKSURI != "" {
+		if !gatewayAuthValidRemoteURI(policy.JWT.RemoteJWKSURI) {
+			return true
+		}
+	}
+	if policy.OIDC != nil {
+		if !policy.OIDC.ClientSecret.Found || len(policy.OIDC.ClientSecret.Value) == 0 || !policy.OIDC.CookieSecret.Found || len(policy.OIDC.CookieSecret.Value) == 0 {
+			return true
+		}
+		if policy.OIDC.Endpoints == nil || policy.OIDC.Endpoints.Authorization == "" || policy.OIDC.Endpoints.Token == "" {
+			return true
+		}
+		if !gatewayAuthValidRemoteURI(policy.OIDC.Endpoints.Token) {
+			return true
+		}
+	}
+	return false
+}
+
+func gatewayAuthValidRemoteURI(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return false
+	}
+	return parsed.Hostname() != ""
+}
+
+func mergeGatewayAuthPolicyAncestorStatus(
+	ancestors []gatewayv1.PolicyAncestorStatus,
+	parentRef gatewayv1.ParentReference,
+	controllerName gatewayv1.GatewayController,
+	conditions ...metav1.Condition,
+) []gatewayv1.PolicyAncestorStatus {
+	for i := range ancestors {
+		if reflect.DeepEqual(ancestors[i].AncestorRef, parentRef) && ancestors[i].ControllerName == controllerName {
+			ancestors[i].Conditions = helpers.MergeConditions(ancestors[i].Conditions, conditions...)
+			return ancestors
+		}
+	}
+
+	ancestors = append(ancestors, gatewayv1.PolicyAncestorStatus{
+		AncestorRef:    parentRef,
+		ControllerName: controllerName,
+		Conditions:     conditions,
+	})
+	return ancestors
+}
+
+func (r *gatewayReconciler) updateGatewayAuthPolicyStatus(ctx context.Context, scopedLog *slog.Logger, original *v2alpha1.CiliumGatewayAuthPolicy, new *v2alpha1.CiliumGatewayAuthPolicy) error {
+	oldStatus := original.Status.DeepCopy()
+	newStatus := new.Status.DeepCopy()
+
+	if cmp.Equal(oldStatus, newStatus, cmpopts.IgnoreFields(metav1.Condition{}, lastTransitionTime)) {
+		return nil
+	}
+	scopedLog.Debug("CiliumGatewayAuthPolicy status", logfields.Resource, types.NamespacedName{Name: original.Name, Namespace: original.Namespace})
 	return r.Client.Status().Update(ctx, new)
 }
 
