@@ -12,6 +12,7 @@ import (
 
 	mutation_rules_v3 "github.com/envoyproxy/go-control-plane/envoy/config/common/mutation_rules/v3"
 	envoy_config_core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	envoy_config_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	basicauthv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/basic_auth/v3"
 	httpCorsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
 	extauthzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
@@ -283,7 +284,7 @@ func (i *cecTranslator) httpConnectionManagerMutators() []HttpConnectionManagerM
 	}
 }
 
-func (i *cecTranslator) getHTTPConnectionManagerHttpFilters(m *model.Model) []*httpConnectionManagerv3.HttpFilter {
+func (i *cecTranslator) getHTTPConnectionManagerHttpFilters(m *model.Model, includeOIDC bool) []*httpConnectionManagerv3.HttpFilter {
 	hf := []*httpConnectionManagerv3.HttpFilter{}
 	if m.GRPCWebTranslationEnabled() {
 		hf = append(hf, &httpConnectionManagerv3.HttpFilter{
@@ -310,7 +311,7 @@ func (i *cecTranslator) getHTTPConnectionManagerHttpFilters(m *model.Model) []*h
 	// tasks, but the stage boundaries and ordering are defined here so new auth
 	// filters cannot accidentally drift relative to existing ExternalAuth.
 	hf = append(hf, i.getHTTPRouteMutationFilters(m)...)
-	hf = append(hf, i.getHTTPAuthenticationFilters(m)...)
+	hf = append(hf, i.getHTTPAuthenticationFilters(m, includeOIDC)...)
 	hf = append(hf, i.getHTTPAuthorizationFilters(m)...)
 	hf = append(hf, i.getHTTPTerminalFilters(m)...)
 
@@ -323,7 +324,7 @@ func (i *cecTranslator) getHTTPRouteMutationFilters(_ *model.Model) []*httpConne
 	return nil
 }
 
-func (i *cecTranslator) getHTTPAuthenticationFilters(m *model.Model) []*httpConnectionManagerv3.HttpFilter {
+func (i *cecTranslator) getHTTPAuthenticationFilters(m *model.Model, includeOIDC bool) []*httpConnectionManagerv3.HttpFilter {
 	hf := make([]*httpConnectionManagerv3.HttpFilter, 0)
 	for _, auth := range i.getUniqueGatewayBasicAuthFilters(m) {
 		hf = append(hf, buildBasicAuthHTTPFilter(auth))
@@ -331,9 +332,11 @@ func (i *cecTranslator) getHTTPAuthenticationFilters(m *model.Model) []*httpConn
 	if hasGatewayAPIKeyAuth(m) {
 		hf = append(hf, buildAPIKeyAuthHTTPFilter())
 	}
-	for _, policy := range getGatewayOIDCPolicies(m) {
-		if filter := i.buildOIDCHTTPFilter(policy); filter != nil {
-			hf = append(hf, filter)
+	if includeOIDC {
+		for _, policy := range getGatewayOIDCPolicies(m) {
+			if filter := i.buildOIDCHTTPFilter(policy); filter != nil {
+				hf = append(hf, filter)
+			}
 		}
 	}
 	if hasGatewayJWTAuth(m) {
@@ -383,7 +386,7 @@ func (i *cecTranslator) getHTTPTerminalFilters(m *model.Model) []*httpConnection
 }
 
 // desiredHTTPConnectionManager returns a new HTTP connection manager filter with the given name and route.
-func (i *cecTranslator) desiredHTTPConnectionManager(name, routeName string, m *model.Model) (ciliumv2.XDSResource, error) {
+func (i *cecTranslator) desiredHTTPConnectionManager(name, routeName string, m *model.Model, includeOIDC bool) (ciliumv2.XDSResource, error) {
 	connectionManager := &httpConnectionManagerv3.HttpConnectionManager{
 		StatPrefix: name,
 		AccessLog:  getHTTPAccessLogs(m),
@@ -392,7 +395,7 @@ func (i *cecTranslator) desiredHTTPConnectionManager(name, routeName string, m *
 		},
 		UseRemoteAddress: &wrapperspb.BoolValue{Value: true},
 		SkipXffAppend:    false,
-		HttpFilters:      i.getHTTPConnectionManagerHttpFilters(m),
+		HttpFilters:      i.getHTTPConnectionManagerHttpFilters(m, includeOIDC),
 		UpgradeConfigs: []*httpConnectionManagerv3.HttpConnectionManager_UpgradeConfig{
 			{UpgradeType: "websocket"},
 		},
@@ -654,7 +657,7 @@ func (i *cecTranslator) buildOIDCHTTPFilter(policy model.GatewayAuthPolicy) *htt
 			TokenEndpoint: &envoy_config_core.HttpUri{
 				Uri: policy.OIDC.Endpoints.Token,
 				HttpUpstreamType: &envoy_config_core.HttpUri_Cluster{
-					Cluster: tokenClusterName,
+					Cluster: i.scopedXDSResourceName(tokenClusterName),
 				},
 				Timeout: &durationpb.Duration{Seconds: 10},
 			},
@@ -676,9 +679,12 @@ func (i *cecTranslator) buildOIDCHTTPFilter(policy model.GatewayAuthPolicy) *htt
 			RedirectUri:         "%REQ(:scheme)%://%REQ(:authority)%" + oidcCallbackPath(policy),
 			RedirectPathMatcher: exactPathMatcher(oidcCallbackPath(policy)),
 			SignoutPath:         exactPathMatcher(oidcLogoutPath(policy)),
-			AuthScopes:          append([]string(nil), policy.OIDC.Scopes...),
-			ForwardBearerToken:  true,
-			StatPrefix:          fmt.Sprintf("%s.%s", policy.Source.Namespace, policy.Source.Name),
+			PassThroughMatcher: []*envoy_config_route_v3.HeaderMatcher{
+				pathExactHeaderMatcher("/favicon.ico"),
+			},
+			AuthScopes:         append([]string(nil), policy.OIDC.Scopes...),
+			ForwardBearerToken: true,
+			StatPrefix:         fmt.Sprintf("%s.%s", policy.Source.Namespace, policy.Source.Name),
 		},
 	}
 
@@ -850,10 +856,30 @@ func gatewayAuthSDSSecretName(secretsNamespace, namespace, name, key string) str
 	return fmt.Sprintf("%s/%s", secretsNamespace, gatewayhelpers.SyncedSecretKeyName(namespace, name, key))
 }
 
+func (i *cecTranslator) scopedXDSResourceName(name string) string {
+	if i == nil || i.resourceNamespace == "" || i.resourceName == "" {
+		return name
+	}
+	return fmt.Sprintf("%s/%s/%s", i.resourceNamespace, i.resourceName, name)
+}
+
 func exactPathMatcher(path string) *envoy_type_matcher_v3.PathMatcher {
 	return &envoy_type_matcher_v3.PathMatcher{
 		Rule: &envoy_type_matcher_v3.PathMatcher_Path{
 			Path: &envoy_type_matcher_v3.StringMatcher{
+				MatchPattern: &envoy_type_matcher_v3.StringMatcher_Exact{
+					Exact: path,
+				},
+			},
+		},
+	}
+}
+
+func pathExactHeaderMatcher(path string) *envoy_config_route_v3.HeaderMatcher {
+	return &envoy_config_route_v3.HeaderMatcher{
+		Name: ":path",
+		HeaderMatchSpecifier: &envoy_config_route_v3.HeaderMatcher_StringMatch{
+			StringMatch: &envoy_type_matcher_v3.StringMatcher{
 				MatchPattern: &envoy_type_matcher_v3.StringMatcher_Exact{
 					Exact: path,
 				},

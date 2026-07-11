@@ -325,7 +325,7 @@ func (i *cecTranslator) httpsFilterChains(name string, m *model.Model) ([]*envoy
 	var filterChains []*envoy_config_listener.FilterChain
 	for idx, spec := range specs {
 		secureHCMName := fmt.Sprintf("%s-%s-%d", name, secureHost, idx)
-		secureHCM, err := i.desiredHTTPConnectionManager(secureHCMName, fmt.Sprintf("%s-%s", name, secureHost), spec.filterModel)
+		secureHCM, err := i.desiredHTTPConnectionManager(secureHCMName, fmt.Sprintf("%s-%s", name, secureHost), spec.filterModel, true)
 		if err != nil {
 			return nil, err
 		}
@@ -533,6 +533,7 @@ func (i *cecTranslator) httpFilterChain(name string, m *model.Model) (*envoy_con
 		insecureHttpConnectionManagerName,
 		insecureHttpConnectionManagerName,
 		m,
+		false,
 	)
 	if err != nil {
 		return nil, err
@@ -561,7 +562,7 @@ func (i *cecTranslator) httpsFilterChainsForPort(name string, port uint32, m *mo
 	var filterChains []*envoy_config_listener.FilterChain
 	for idx, spec := range specs {
 		hcmName := fmt.Sprintf("%s-%d", name, idx)
-		hcm, err := i.desiredHTTPConnectionManager(hcmName, name, spec.filterModel)
+		hcm, err := i.desiredHTTPConnectionManager(hcmName, name, spec.filterModel, true)
 		if err != nil {
 			return nil, err
 		}

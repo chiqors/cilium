@@ -26,7 +26,7 @@ func Test_desiredHTTPConnectionManager(t *testing.T) {
 	t.Run("no CORS filter enabled", func(t *testing.T) {
 		i := &cecTranslator{}
 		m := &model.Model{}
-		res, err := i.desiredHTTPConnectionManager("dummy-name", "dummy-route-name", m)
+		res, err := i.desiredHTTPConnectionManager("dummy-name", "dummy-route-name", m, true)
 		require.NoError(t, err)
 
 		httpConnectionManager := &httpConnectionManagerv3.HttpConnectionManager{}
@@ -58,7 +58,7 @@ func Test_desiredHTTPConnectionManager(t *testing.T) {
 				},
 			},
 		}}
-		res, err := i.desiredHTTPConnectionManager("dummy-name", "dummy-route-name", m)
+		res, err := i.desiredHTTPConnectionManager("dummy-name", "dummy-route-name", m, true)
 		require.NoError(t, err)
 
 		httpConnectionManager := &httpConnectionManagerv3.HttpConnectionManager{}
@@ -94,7 +94,7 @@ func Test_desiredHTTPConnectionManager(t *testing.T) {
 				},
 			},
 		}
-		res, err := i.desiredHTTPConnectionManager("dummy-name", "dummy-route-name", m)
+		res, err := i.desiredHTTPConnectionManager("dummy-name", "dummy-route-name", m, true)
 		require.NoError(t, err)
 
 		httpConnectionManager := &httpConnectionManagerv3.HttpConnectionManager{}
@@ -110,7 +110,7 @@ func Test_getHTTPConnectionManagerHttpFilters(t *testing.T) {
 	t.Run("no CORS filter enabled", func(t *testing.T) {
 		m := &model.Model{}
 		i := &cecTranslator{}
-		res := i.getHTTPConnectionManagerHttpFilters(m)
+		res := i.getHTTPConnectionManagerHttpFilters(m, true)
 
 		require.Len(t, res, 3)
 		require.Equal(t, "envoy.filters.http.grpc_web", res[0].Name)
@@ -128,7 +128,7 @@ func Test_getHTTPConnectionManagerHttpFilters(t *testing.T) {
 			},
 		}}
 		i := &cecTranslator{}
-		res := i.getHTTPConnectionManagerHttpFilters(m)
+		res := i.getHTTPConnectionManagerHttpFilters(m, true)
 
 		require.Len(t, res, 4)
 		require.Equal(t, "envoy.filters.http.grpc_web", res[0].Name)
@@ -153,7 +153,7 @@ func Test_getHTTPConnectionManagerHttpFilters(t *testing.T) {
 			},
 		}
 		i := &cecTranslator{}
-		res := i.getHTTPConnectionManagerHttpFilters(m)
+		res := i.getHTTPConnectionManagerHttpFilters(m, true)
 
 		require.Len(t, res, 4)
 		require.Equal(t, "envoy.filters.http.grpc_web", res[0].Name)
@@ -180,7 +180,7 @@ func Test_getHTTPConnectionManagerHttpFilters(t *testing.T) {
 			},
 		}
 		i := &cecTranslator{}
-		res := i.getHTTPConnectionManagerHttpFilters(m)
+		res := i.getHTTPConnectionManagerHttpFilters(m, true)
 
 		require.Len(t, res, 4)
 		require.Equal(t, "envoy.filters.http.grpc_web", res[0].Name)
@@ -215,7 +215,7 @@ func Test_getHTTPConnectionManagerHttpFilters(t *testing.T) {
 			},
 		}
 		i := &cecTranslator{}
-		res := i.getHTTPConnectionManagerHttpFilters(m)
+		res := i.getHTTPConnectionManagerHttpFilters(m, true)
 
 		require.Len(t, res, 4)
 		require.Equal(t, "envoy.filters.http.grpc_web", res[0].Name)
@@ -256,7 +256,7 @@ func Test_getHTTPConnectionManagerHttpFilters(t *testing.T) {
 			},
 		}
 		i := &cecTranslator{Config: Config{SecretsNamespace: "cilium-secrets"}}
-		res := i.getHTTPConnectionManagerHttpFilters(m)
+		res := i.getHTTPConnectionManagerHttpFilters(m, true)
 
 		require.Len(t, res, 4)
 		require.Equal(t, oidcFilterName(m.GatewayAuth.Policies[0]), res[2].Name)
@@ -269,6 +269,72 @@ func Test_getHTTPConnectionManagerHttpFilters(t *testing.T) {
 		require.NotNil(t, oauth2Filter.GetConfig().GetCredentials().GetTokenSecret().GetSdsConfig())
 		require.NotNil(t, oauth2Filter.GetConfig().GetCredentials().GetHmacSecret().GetSdsConfig())
 		require.Equal(t, "https://issuer.example.com/token", oauth2Filter.GetConfig().GetTokenEndpoint().GetUri())
+		require.Len(t, oauth2Filter.GetConfig().GetPassThroughMatcher(), 1)
+		require.Equal(t, ":path", oauth2Filter.GetConfig().GetPassThroughMatcher()[0].GetName())
+		require.Equal(t, "/favicon.ico", oauth2Filter.GetConfig().GetPassThroughMatcher()[0].GetStringMatch().GetExact())
+	})
+
+	t.Run("oidc auth filter is omitted when oidc is disabled for the listener", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{
+				Routes: []model.HTTPRoute{{GatewayAuthPolicy: "default/oidc"}},
+			}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{{
+					Source: model.FullyQualifiedResource{Name: "oidc", Namespace: "default"},
+					OIDC: &model.GatewayOIDCAuth{
+						Issuer:       "https://issuer.example.com",
+						ClientID:     "client-id",
+						ClientSecret: model.GatewayAuthSecretRef{Name: "client", Key: "clientSecret", Found: true},
+						CookieSecret: model.GatewayAuthSecretRef{Name: "cookie", Key: "cookieSecret", Found: true},
+						Endpoints: &model.GatewayOIDCEndpoints{
+							Authorization: "https://issuer.example.com/authorize",
+							Token:         "https://issuer.example.com/token",
+						},
+					},
+				}},
+			},
+		}
+		i := &cecTranslator{Config: Config{SecretsNamespace: "cilium-secrets"}}
+		res := i.getHTTPConnectionManagerHttpFilters(m, false)
+
+		require.Len(t, res, 3)
+		require.Equal(t, "envoy.filters.http.grpc_web", res[0].Name)
+		require.Equal(t, "envoy.filters.http.grpc_stats", res[1].Name)
+		require.Equal(t, "envoy.filters.http.router", res[2].Name)
+	})
+
+	t.Run("oidc token cluster is scoped to owning cec when available", func(t *testing.T) {
+		m := &model.Model{
+			HTTP: []model.HTTPListener{{
+				Routes: []model.HTTPRoute{{GatewayAuthPolicy: "default/oidc"}},
+			}},
+			GatewayAuth: &model.GatewayAuthModel{
+				Policies: []model.GatewayAuthPolicy{{
+					Source: model.FullyQualifiedResource{Name: "oidc", Namespace: "default"},
+					OIDC: &model.GatewayOIDCAuth{
+						Issuer:       "https://issuer.example.com",
+						ClientID:     "client-id",
+						ClientSecret: model.GatewayAuthSecretRef{Name: "client", Key: "clientSecret", Found: true},
+						CookieSecret: model.GatewayAuthSecretRef{Name: "cookie", Key: "cookieSecret", Found: true},
+						Endpoints: &model.GatewayOIDCEndpoints{
+							Authorization: "https://issuer.example.com/authorize",
+							Token:         "https://issuer.example.com/token",
+						},
+					},
+				}},
+			},
+		}
+		i := &cecTranslator{
+			Config:            Config{SecretsNamespace: "cilium-secrets"},
+			resourceNamespace: "kube-system",
+			resourceName:      "cilium-gateway-cilium-gateway",
+		}
+		res := i.getHTTPConnectionManagerHttpFilters(m, true)
+
+		oauth2Filter := &oauth2v3.OAuth2{}
+		require.NoError(t, proto.Unmarshal(res[2].GetTypedConfig().Value, oauth2Filter))
+		require.Equal(t, "kube-system/cilium-gateway-cilium-gateway/oidc:https:issuer.example.com:443", oauth2Filter.GetConfig().GetTokenEndpoint().GetCluster())
 	})
 }
 
@@ -278,7 +344,7 @@ func Test_getHTTPFilterStages(t *testing.T) {
 	t.Run("native auth stages empty until provider translators land", func(t *testing.T) {
 		m := &model.Model{}
 		require.Nil(t, i.getHTTPRouteMutationFilters(m))
-		require.Nil(t, i.getHTTPAuthenticationFilters(m))
+		require.Nil(t, i.getHTTPAuthenticationFilters(m, true))
 	})
 
 	t.Run("authorization stage contains ext auth filters", func(t *testing.T) {
@@ -373,7 +439,7 @@ func Test_desiredHTTPConnectionManager_withExtAuthz(t *testing.T) {
 		}},
 	}
 	authFilters := i.getUniqueAuthFilters(m)
-	res, err := i.desiredHTTPConnectionManager("dummy-name", "dummy-route-name", m)
+	res, err := i.desiredHTTPConnectionManager("dummy-name", "dummy-route-name", m, true)
 	require.NoError(t, err)
 
 	hcm := &httpConnectionManagerv3.HttpConnectionManager{}
@@ -904,7 +970,7 @@ func Test_desiredHTTPConnectionManagerWithoutGRPCWebTranslation(t *testing.T) {
 			},
 		},
 	}
-	res, err := i.desiredHTTPConnectionManager("dummy-name", "dummy-route-name", m)
+	res, err := i.desiredHTTPConnectionManager("dummy-name", "dummy-route-name", m, true)
 	require.NoError(t, err)
 
 	httpConnectionManager := &httpConnectionManagerv3.HttpConnectionManager{}

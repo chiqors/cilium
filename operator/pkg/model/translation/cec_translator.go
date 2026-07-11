@@ -87,6 +87,9 @@ type Config struct {
 //   - no LB service and endpoint
 type cecTranslator struct {
 	Config Config
+
+	resourceNamespace string
+	resourceName      string
 }
 
 // NewCECTranslator returns a new translator
@@ -97,6 +100,10 @@ func NewCECTranslator(config Config) CECTranslator {
 }
 
 func (i *cecTranslator) Translate(namespace string, name string, model *model.Model) (*ciliumv2.CiliumEnvoyConfig, error) {
+	scoped := *i
+	scoped.resourceNamespace = namespace
+	scoped.resourceName = name
+
 	backendServices, err := i.desiredBackendServices(model)
 	if err != nil {
 		return nil, err
@@ -107,7 +114,7 @@ func (i *cecTranslator) Translate(namespace string, name string, model *model.Mo
 		return nil, err
 	}
 
-	resources, err := i.desiredResources(model)
+	resources, err := scoped.desiredResources(model)
 	if err != nil {
 		return nil, err
 	}
