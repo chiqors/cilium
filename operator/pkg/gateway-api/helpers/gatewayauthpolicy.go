@@ -55,10 +55,6 @@ func ResolveCiliumGatewayAuthPolicyAttachments(
 
 	for i := range policies {
 		policy := &policies[i]
-		if policy.GetNamespace() != gateway.GetNamespace() {
-			continue
-		}
-
 		for _, targetRef := range policy.Spec.TargetRefs {
 			if targetRef.Group != gatewayv1.Group(gatewayv1.GroupName) {
 				continue
@@ -71,6 +67,9 @@ func ResolveCiliumGatewayAuthPolicyAttachments(
 
 			switch targetRef.Kind {
 			case gatewayv1.Kind("Gateway"):
+				if policy.GetNamespace() != gateway.GetNamespace() {
+					continue
+				}
 				if string(targetRef.Name) != gateway.GetName() {
 					continue
 				}

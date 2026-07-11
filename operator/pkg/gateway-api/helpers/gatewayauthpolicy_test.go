@@ -95,6 +95,34 @@ func TestResolveCiliumGatewayAuthPolicyAttachments(t *testing.T) {
 	}
 }
 
+func TestResolveCiliumGatewayAuthPolicyAttachmentsCrossNamespaceRouteTarget(t *testing.T) {
+	gateway := &gatewayv1.Gateway{}
+	gateway.SetNamespace("kube-system")
+	gateway.SetName("shared-gw")
+	gateway.Spec.Listeners = []gatewayv1.Listener{
+		{Name: gatewayv1.SectionName("https")},
+	}
+
+	httpRoute := gatewayv1.HTTPRoute{}
+	httpRoute.SetNamespace("nginx")
+	httpRoute.SetName("nginx-https-route")
+	httpRoute.Spec.Rules = []gatewayv1.HTTPRouteRule{{}}
+
+	policies := []ciliumv2alpha1.CiliumGatewayAuthPolicy{
+		newGatewayAuthPolicy("nginx-route-auth", "nginx", httpRouteTarget("nginx-https-route", nil)),
+	}
+
+	attachments := ResolveCiliumGatewayAuthPolicyAttachments(gateway, []gatewayv1.HTTPRoute{httpRoute}, nil, policies)
+
+	httpCollection := attachments.HTTPRoutes[clientObjectKey(&httpRoute)]
+	if got := len(httpCollection.Resource); got != 1 {
+		t.Fatalf("http route resource attachments = %d, want 1", got)
+	}
+	if httpCollection.Resource[0].Policy.GetName() != "nginx-route-auth" {
+		t.Fatalf("http route resource attachment policy = %s, want nginx-route-auth", httpCollection.Resource[0].Policy.GetName())
+	}
+}
+
 func newGatewayAuthPolicy(name, namespace string, targets ...gatewayv1.LocalPolicyTargetReferenceWithSectionName) ciliumv2alpha1.CiliumGatewayAuthPolicy {
 	policy := ciliumv2alpha1.CiliumGatewayAuthPolicy{}
 	policy.SetName(name)
