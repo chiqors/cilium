@@ -659,7 +659,10 @@ func splitHTTPSListenerByHostname(listener model.HTTPListener) []model.HTTPListe
 		return []model.HTTPListener{listener}
 	}
 
-	keys := maps.Keys(hostnames)
+	keys := make([]string, 0, len(hostnames))
+	for hostname := range hostnames {
+		keys = append(keys, hostname)
+	}
 	goslices.Sort(keys)
 
 	result := make([]model.HTTPListener, 0, len(keys))
