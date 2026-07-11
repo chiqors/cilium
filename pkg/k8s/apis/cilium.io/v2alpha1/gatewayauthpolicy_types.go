@@ -52,7 +52,7 @@ type CiliumGatewayAuthPolicyList struct {
 }
 
 // +kubebuilder:validation:XValidation:message="at least one provider or authorization block must be specified",rule="has(self.basicAuth) || has(self.apiKeyAuth) || has(self.jwt) || has(self.oidc) || has(self.authorization)"
-// +kubebuilder:validation:XValidation:message="targetRefs must reference gateway.networking.k8s.io Gateway, HTTPRoute, or GRPCRoute resources",rule="self.targetRefs.all(t, t.group == 'gateway.networking.k8s.io' && (t.kind == 'Gateway' || t.kind == 'HTTPRoute' || t.kind == 'GRPCRoute')))"
+// +kubebuilder:validation:XValidation:message="targetRefs must reference gateway.networking.k8s.io Gateway, HTTPRoute, or GRPCRoute resources",rule="self.targetRefs.all(t, t.group == 'gateway.networking.k8s.io' && (t.kind == 'Gateway' || t.kind == 'HTTPRoute' || t.kind == 'GRPCRoute'))"
 // +kubebuilder:validation:XValidation:message="basicAuth may not be combined with apiKeyAuth, jwt, or oidc",rule="!has(self.basicAuth) || (!has(self.apiKeyAuth) && !has(self.jwt) && !has(self.oidc))"
 // +kubebuilder:validation:XValidation:message="apiKeyAuth may not be combined with jwt or oidc",rule="!has(self.apiKeyAuth) || (!has(self.jwt) && !has(self.oidc))"
 // +kubebuilder:validation:XValidation:message="jwt and oidc may not both be specified",rule="!has(self.jwt) || !has(self.oidc)"

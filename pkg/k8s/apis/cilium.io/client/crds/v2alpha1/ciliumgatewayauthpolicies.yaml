@@ -452,7 +452,7 @@ spec:
             - message: targetRefs must reference gateway.networking.k8s.io Gateway,
                 HTTPRoute, or GRPCRoute resources
               rule: self.targetRefs.all(t, t.group == 'gateway.networking.k8s.io'
-                && (t.kind == 'Gateway' || t.kind == 'HTTPRoute' || t.kind == 'GRPCRoute')))
+                && (t.kind == 'Gateway' || t.kind == 'HTTPRoute' || t.kind == 'GRPCRoute'))
             - message: basicAuth may not be combined with apiKeyAuth, jwt, or oidc
               rule: '!has(self.basicAuth) || (!has(self.apiKeyAuth) && !has(self.jwt)
                 && !has(self.oidc))'
