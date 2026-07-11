@@ -7,16 +7,17 @@ import (
 	"context"
 	"log/slog"
 	"math/rand/v2"
+	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	controllerruntime "github.com/cilium/cilium/operator/pkg/controller-runtime"
+	gatewayhelpers "github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
@@ -63,10 +64,17 @@ func (r *secretSyncer) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 	synced := false
 	for _, reg := range r.registrations {
 		if reg.RefObjectCheckFunc(ctx, r.client, r.logger, original) || reg.IsDefaultSecret(original) {
-			desiredSync := desiredSyncSecret(reg.SecretsNamespace, original)
+			desiredSyncs := desiredSyncSecrets(reg.SecretsNamespace, original)
 
 			scopedLog.DebugContext(ctx, "Syncing secret", logfields.K8sNamespace, reg.SecretsNamespace)
-			if err := r.ensureSyncedSecret(ctx, desiredSync); err != nil {
+			desiredNames := make(map[string]struct{}, len(desiredSyncs))
+			for _, desiredSync := range desiredSyncs {
+				if err := r.ensureSyncedSecret(ctx, desiredSync); err != nil {
+					return controllerruntime.Fail(err)
+				}
+				desiredNames[desiredSync.Name] = struct{}{}
+			}
+			if err := r.cleanupStaleSyncedSecrets(ctx, original.Namespace, original.Name, reg.SecretsNamespace, desiredNames); err != nil {
 				return controllerruntime.Fail(err)
 			}
 
@@ -124,25 +132,30 @@ func action(synced bool) string {
 }
 
 func (r *secretSyncer) cleanupSyncedSecret(ctx context.Context, req reconcile.Request, scopedLog *slog.Logger, ns string) (bool, error) {
-	syncSecret := &corev1.Secret{}
-	syncedSecretName := types.NamespacedName{Namespace: ns, Name: req.Namespace + "-" + req.Name}
-	if err := r.client.Get(ctx, syncedSecretName, syncSecret); err == nil {
-		// Try to delete existing synced secret
-		scopedLog.DebugContext(ctx, "Delete synced secret", logfields.K8sNamespace, ns)
-		if err := r.client.Delete(ctx, syncSecret); err != nil {
-			return true, err
-		}
-
-		return true, nil
+	secrets := &corev1.SecretList{}
+	if err := r.client.List(ctx, secrets, client.InNamespace(ns), client.MatchingLabels{
+		OwningSecretNamespace: req.Namespace,
+		OwningSecretName:      req.Name,
+	}); err != nil {
+		return false, err
 	}
 
-	return false, nil
+	deleted := false
+	for i := range secrets.Items {
+		scopedLog.DebugContext(ctx, "Delete synced secret", logfields.K8sNamespace, ns, logfields.Secret, secrets.Items[i].Name)
+		if err := r.client.Delete(ctx, &secrets.Items[i]); err != nil {
+			return true, err
+		}
+		deleted = true
+	}
+
+	return deleted, nil
 }
 
-func desiredSyncSecret(secretsNamespace string, original *corev1.Secret) *corev1.Secret {
+func desiredSyncSecret(secretsNamespace string, original *corev1.Secret, name string) *corev1.Secret {
 	s := &corev1.Secret{}
 	s.SetNamespace(secretsNamespace)
-	s.SetName(original.Namespace + "-" + original.Name)
+	s.SetName(name)
 	s.SetAnnotations(original.GetAnnotations())
 	s.SetLabels(original.GetLabels())
 	if s.Labels == nil {
@@ -156,6 +169,33 @@ func desiredSyncSecret(secretsNamespace string, original *corev1.Secret) *corev1
 	s.Type = original.Type
 
 	return s
+}
+
+func desiredSyncSecrets(secretsNamespace string, original *corev1.Secret) []*corev1.Secret {
+	desired := []*corev1.Secret{
+		desiredSyncSecret(secretsNamespace, original, gatewayhelpers.SyncedSecretName(original.Namespace, original.Name)),
+	}
+
+	if len(original.Data) <= 1 {
+		return desired
+	}
+
+	keys := make([]string, 0, len(original.Data))
+	for key := range original.Data {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		perKey := desiredSyncSecret(secretsNamespace, original, gatewayhelpers.SyncedSecretKeyName(original.Namespace, original.Name, key))
+		perKey.Data = map[string][]byte{
+			"generic": original.Data[key],
+		}
+		perKey.StringData = nil
+		desired = append(desired, perKey)
+	}
+
+	return desired
 }
 
 func (r *secretSyncer) ensureSyncedSecret(ctx context.Context, desired *corev1.Secret) error {
@@ -183,4 +223,25 @@ func (r *secretSyncer) ensureSyncedSecret(ctx context.Context, desired *corev1.S
 	temp.Type = desired.Type
 
 	return r.client.Patch(ctx, temp, client.MergeFrom(existing))
+}
+
+func (r *secretSyncer) cleanupStaleSyncedSecrets(ctx context.Context, sourceNamespace, sourceName, syncedNamespace string, desiredNames map[string]struct{}) error {
+	secrets := &corev1.SecretList{}
+	if err := r.client.List(ctx, secrets, client.InNamespace(syncedNamespace), client.MatchingLabels{
+		OwningSecretNamespace: sourceNamespace,
+		OwningSecretName:      sourceName,
+	}); err != nil {
+		return err
+	}
+
+	for i := range secrets.Items {
+		if _, ok := desiredNames[secrets.Items[i].Name]; ok {
+			continue
+		}
+		if err := r.client.Delete(ctx, &secrets.Items[i]); err != nil && !k8serrors.IsNotFound(err) {
+			return err
+		}
+	}
+
+	return nil
 }

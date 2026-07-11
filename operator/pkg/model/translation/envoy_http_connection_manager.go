@@ -27,6 +27,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
+	gatewayhelpers "github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 	"github.com/cilium/cilium/operator/pkg/model"
 	"github.com/cilium/cilium/pkg/envoy"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -661,11 +662,11 @@ func (i *cecTranslator) buildOIDCHTTPFilter(policy model.GatewayAuthPolicy) *htt
 			Credentials: &oauth2v3.OAuth2Credentials{
 				ClientId: policy.OIDC.ClientID,
 				TokenSecret: &envoy_config_tls_v3.SdsSecretConfig{
-					Name: gatewayAuthSDSSecretName(i.Config.SecretsNamespace, policy.Source.Namespace, policy.OIDC.ClientSecret.Name),
+					Name: gatewayAuthSDSSecretName(i.Config.SecretsNamespace, policy.Source.Namespace, policy.OIDC.ClientSecret.Name, policy.OIDC.ClientSecret.Key),
 				},
 				TokenFormation: &oauth2v3.OAuth2Credentials_HmacSecret{
 					HmacSecret: &envoy_config_tls_v3.SdsSecretConfig{
-						Name: gatewayAuthSDSSecretName(i.Config.SecretsNamespace, policy.Source.Namespace, policy.OIDC.CookieSecret.Name),
+						Name: gatewayAuthSDSSecretName(i.Config.SecretsNamespace, policy.Source.Namespace, policy.OIDC.CookieSecret.Name, policy.OIDC.CookieSecret.Key),
 					},
 				},
 			},
@@ -842,8 +843,8 @@ func getOIDCTokenClusterName(uri string) (string, error) {
 	return fmt.Sprintf("oidc:%s:%s:%s", strings.ToLower(parsed.Scheme), host, port), nil
 }
 
-func gatewayAuthSDSSecretName(secretsNamespace, namespace, name string) string {
-	return fmt.Sprintf("%s/%s-%s", secretsNamespace, namespace, name)
+func gatewayAuthSDSSecretName(secretsNamespace, namespace, name, key string) string {
+	return fmt.Sprintf("%s/%s", secretsNamespace, gatewayhelpers.SyncedSecretKeyName(namespace, name, key))
 }
 
 func exactPathMatcher(path string) *envoy_type_matcher_v3.PathMatcher {

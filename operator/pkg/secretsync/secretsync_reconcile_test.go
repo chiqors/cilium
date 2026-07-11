@@ -4,6 +4,7 @@
 package secretsync_test
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 	"time"
@@ -65,7 +66,7 @@ var secretFixture = []client.Object{
 			Name:      "test-synced-secret-no-reference",
 			Labels: map[string]string{
 				secretsync.OwningSecretNamespace: "test",
-				secretsync.OwningSecretName:      "syced-secret-no-reference",
+				secretsync.OwningSecretName:      "synced-secret-no-reference",
 			},
 		},
 	},
@@ -514,6 +515,70 @@ func Test_SecretSync_Reconcile_WithDefaultSecret(t *testing.T) {
 		err = c.Get(t.Context(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-unsynced-secret-no-reference"}, secret)
 		require.NoError(t, err)
 	})
+}
+
+func Test_SecretSync_Reconcile_MultiKeyDerivedSecrets(t *testing.T) {
+	logger := hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug))
+
+	c := fake.NewClientBuilder().
+		WithScheme(testScheme()).
+		WithObjects(&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "test",
+				Name:      "oidc-secret",
+			},
+			Type: corev1.SecretTypeOpaque,
+			Data: map[string][]byte{
+				"clientSecret": []byte("client-value"),
+				"cookieSecret": []byte("cookie-value"),
+			},
+		}).
+		Build()
+
+	r := secretsync.NewSecretSyncReconciler(c, logger, []*secretsync.SecretSyncRegistration{
+		{
+			RefObject:          &gatewayv1.Gateway{},
+			SecretsNamespace:   secretsNamespace,
+			RefObjectCheckFunc: func(_ context.Context, _ client.Client, _ *slog.Logger, _ *corev1.Secret) bool { return false },
+			DefaultSecret: &secretsync.DefaultSecret{
+				Namespace: "test",
+				Name:      "oidc-secret",
+			},
+		},
+	}, time.Minute, 0.1)
+
+	result, err := r.Reconcile(t.Context(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "test", Name: "oidc-secret"},
+	})
+	require.NoError(t, err)
+	require.True(t, resultHasResync(result))
+
+	base := &corev1.Secret{}
+	require.NoError(t, c.Get(t.Context(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-oidc-secret"}, base))
+	require.Equal(t, []byte("client-value"), base.Data["clientSecret"])
+	require.Equal(t, []byte("cookie-value"), base.Data["cookieSecret"])
+
+	clientSecret := &corev1.Secret{}
+	require.NoError(t, c.Get(t.Context(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-oidc-secret-clientsecret"}, clientSecret))
+	require.Equal(t, map[string][]byte{"generic": []byte("client-value")}, clientSecret.Data)
+
+	cookieSecret := &corev1.Secret{}
+	require.NoError(t, c.Get(t.Context(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-oidc-secret-cookiesecret"}, cookieSecret))
+	require.Equal(t, map[string][]byte{"generic": []byte("cookie-value")}, cookieSecret.Data)
+
+	source := &corev1.Secret{}
+	require.NoError(t, c.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "oidc-secret"}, source))
+	delete(source.Data, "cookieSecret")
+	require.NoError(t, c.Update(t.Context(), source))
+
+	result, err = r.Reconcile(t.Context(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "test", Name: "oidc-secret"},
+	})
+	require.NoError(t, err)
+	require.True(t, resultHasResync(result))
+
+	err = c.Get(t.Context(), types.NamespacedName{Namespace: secretsNamespace, Name: "test-oidc-secret-cookiesecret"}, &corev1.Secret{})
+	require.True(t, k8sErrors.IsNotFound(err))
 }
 
 func testScheme() *runtime.Scheme {

@@ -1082,10 +1082,8 @@ func Test_envoyHTTPRoutes_differentGatewayOIDCPolicies(t *testing.T) {
 	res := envoyHTTPRoutes(m, m.HTTP[0].Routes, []string{"*"}, false, 80, nil)
 	require.Len(t, res, 2)
 
-	_, hasDisableA := res[0].TypedPerFilterConfig[oidcFilterName(m.GatewayAuth.Policies[1])]
-	require.True(t, hasDisableA)
-	_, hasDisableB := res[1].TypedPerFilterConfig[oidcFilterName(m.GatewayAuth.Policies[0])]
-	require.True(t, hasDisableB)
+	require.Nil(t, res[0].TypedPerFilterConfig)
+	require.Nil(t, res[1].TypedPerFilterConfig)
 }
 
 func Test_envoyHTTPRoutes_preservesAuthWithRewrite(t *testing.T) {

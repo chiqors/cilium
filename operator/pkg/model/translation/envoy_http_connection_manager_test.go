@@ -245,8 +245,8 @@ func Test_getHTTPConnectionManagerHttpFilters(t *testing.T) {
 					OIDC: &model.GatewayOIDCAuth{
 						Issuer:       "https://issuer.example.com",
 						ClientID:     "client-id",
-						ClientSecret: model.GatewayAuthSecretRef{Name: "client", Found: true},
-						CookieSecret: model.GatewayAuthSecretRef{Name: "cookie", Found: true},
+						ClientSecret: model.GatewayAuthSecretRef{Name: "client", Key: "clientSecret", Found: true},
+						CookieSecret: model.GatewayAuthSecretRef{Name: "cookie", Key: "cookieSecret", Found: true},
 						Endpoints: &model.GatewayOIDCEndpoints{
 							Authorization: "https://issuer.example.com/authorize",
 							Token:         "https://issuer.example.com/token",
@@ -264,7 +264,8 @@ func Test_getHTTPConnectionManagerHttpFilters(t *testing.T) {
 		oauth2Filter := &oauth2v3.OAuth2{}
 		require.NoError(t, proto.Unmarshal(res[2].GetTypedConfig().Value, oauth2Filter))
 		require.Equal(t, "client-id", oauth2Filter.GetConfig().GetCredentials().GetClientId())
-		require.Equal(t, "cilium-secrets/default-client", oauth2Filter.GetConfig().GetCredentials().GetTokenSecret().GetName())
+		require.Equal(t, "cilium-secrets/default-client-clientsecret", oauth2Filter.GetConfig().GetCredentials().GetTokenSecret().GetName())
+		require.Equal(t, "cilium-secrets/default-cookie-cookiesecret", oauth2Filter.GetConfig().GetCredentials().GetHmacSecret().GetName())
 		require.Equal(t, "https://issuer.example.com/token", oauth2Filter.GetConfig().GetTokenEndpoint().GetUri())
 	})
 }
@@ -670,7 +671,7 @@ func Test_getTypedPerFilterConfig(t *testing.T) {
 		require.True(t, disabled.GetDisabled())
 	})
 
-	t.Run("route without selected oidc policy disables other oidc filters", func(t *testing.T) {
+	t.Run("oidc does not rely on per-route filter config", func(t *testing.T) {
 		m := &model.Model{
 			HTTP: []model.HTTPListener{{Routes: []model.HTTPRoute{{GatewayAuthPolicy: "default/oidc-a"}, {}}}},
 			GatewayAuth: &model.GatewayAuthModel{
@@ -689,12 +690,7 @@ func Test_getTypedPerFilterConfig(t *testing.T) {
 			},
 		}
 
-		cfg := getTypedPerFilterConfig(m, nil, nil, model.HTTPRoute{})
-		require.Len(t, cfg, 1)
-
-		perRoute := &oauth2v3.OAuth2{}
-		require.NoError(t, proto.Unmarshal(cfg[oidcFilterName(m.GatewayAuth.Policies[0])].Value, perRoute))
-		require.Nil(t, perRoute.GetConfig())
+		require.Nil(t, getTypedPerFilterConfig(m, nil, nil, model.HTTPRoute{}))
 	})
 
 	t.Run("route with gateway authorization configures per-route rbac", func(t *testing.T) {

@@ -317,27 +317,20 @@ func (i *cecTranslator) filterChains(name string, m *model.Model) ([]*envoy_conf
 
 // httpsFilterChains returns the HTTPS filter chains for the given model.
 func (i *cecTranslator) httpsFilterChains(name string, m *model.Model) ([]*envoy_config_listener.FilterChain, error) {
-	tlsToHostnames := m.TLSSecretsToHostnames()
-	if len(tlsToHostnames) == 0 {
+	specs := httpsFilterChainSpecs(m, 0, false)
+	if len(specs) == 0 {
 		return nil, nil
 	}
 
 	var filterChains []*envoy_config_listener.FilterChain
-
-	orderedSecrets := goslices.SortedStableFunc(maps.Keys(tlsToHostnames), func(a, b model.TLSSecret) int {
-		return cmp.Compare(a.Namespace+"/"+a.Name, b.Namespace+"/"+b.Name)
-	})
-
-	for _, secret := range orderedSecrets {
-		hostNames := tlsToHostnames[secret]
-
-		secureHCMName := fmt.Sprintf("%s-%s", name, secureHost)
-		secureHCM, err := i.desiredHTTPConnectionManager(secureHCMName, secureHCMName, m)
+	for idx, spec := range specs {
+		secureHCMName := fmt.Sprintf("%s-%s-%d", name, secureHost, idx)
+		secureHCM, err := i.desiredHTTPConnectionManager(secureHCMName, fmt.Sprintf("%s-%s", name, secureHost), spec.filterModel)
 		if err != nil {
 			return nil, err
 		}
 		filterChains = append(filterChains, &envoy_config_listener.FilterChain{
-			FilterChainMatch: toFilterChainMatch(hostNames),
+			FilterChainMatch: toFilterChainMatch(spec.hostnames),
 			Filters: []*envoy_config_listener.Filter{
 				{
 					Name: httpConnectionManagerType,
@@ -346,7 +339,7 @@ func (i *cecTranslator) httpsFilterChains(name string, m *model.Model) ([]*envoy
 					},
 				},
 			},
-			TransportSocket: toTransportSocket(i.Config.SecretsNamespace, []model.TLSSecret{secret}),
+			TransportSocket: toTransportSocket(i.Config.SecretsNamespace, []model.TLSSecret{spec.secret}),
 		})
 	}
 
@@ -560,42 +553,20 @@ func (i *cecTranslator) httpFilterChain(name string, m *model.Model) (*envoy_con
 
 // httpsFilterChainsForPort returns the HTTPS filter chains for the given port.
 func (i *cecTranslator) httpsFilterChainsForPort(name string, port uint32, m *model.Model) ([]*envoy_config_listener.FilterChain, error) {
-	tlsToListeners := m.TLSSecretsToListeners()
-	if len(tlsToListeners) == 0 {
+	specs := httpsFilterChainSpecs(m, port, true)
+	if len(specs) == 0 {
 		return nil, nil
 	}
-
-	hostsBySecret := map[model.TLSSecret][]string{}
-	for secret, refs := range tlsToListeners {
-		for _, ref := range refs {
-			if ref.Port == port {
-				hostsBySecret[secret] = append(hostsBySecret[secret], ref.Hostname)
-			}
-		}
-	}
-
-	if len(hostsBySecret) == 0 {
-		return nil, nil
-	}
-
-	orderedSecrets := make([]model.TLSSecret, 0, len(hostsBySecret))
-	for secret := range hostsBySecret {
-		orderedSecrets = append(orderedSecrets, secret)
-	}
-	goslices.SortStableFunc(orderedSecrets, func(a, b model.TLSSecret) int {
-		return cmp.Compare(a.Namespace+"/"+a.Name, b.Namespace+"/"+b.Name)
-	})
 
 	var filterChains []*envoy_config_listener.FilterChain
-	for _, secret := range orderedSecrets {
-		hostNames := hostsBySecret[secret]
-
-		hcm, err := i.desiredHTTPConnectionManager(name, name, m)
+	for idx, spec := range specs {
+		hcmName := fmt.Sprintf("%s-%d", name, idx)
+		hcm, err := i.desiredHTTPConnectionManager(hcmName, name, spec.filterModel)
 		if err != nil {
 			return nil, err
 		}
 		filterChains = append(filterChains, &envoy_config_listener.FilterChain{
-			FilterChainMatch: toFilterChainMatch(hostNames),
+			FilterChainMatch: toFilterChainMatch(spec.hostnames),
 			Filters: []*envoy_config_listener.Filter{
 				{
 					Name: httpConnectionManagerType,
@@ -604,11 +575,106 @@ func (i *cecTranslator) httpsFilterChainsForPort(name string, port uint32, m *mo
 					},
 				},
 			},
-			TransportSocket: toTransportSocket(i.Config.SecretsNamespace, []model.TLSSecret{secret}),
+			TransportSocket: toTransportSocket(i.Config.SecretsNamespace, []model.TLSSecret{spec.secret}),
 		})
 	}
 
 	return filterChains, nil
+}
+
+type httpsFilterChainSpec struct {
+	secret      model.TLSSecret
+	hostnames   []string
+	filterModel *model.Model
+}
+
+type httpsFilterChainKey struct {
+	secret   model.TLSSecret
+	hostname string
+	port     uint32
+}
+
+func httpsFilterChainSpecs(m *model.Model, port uint32, perPort bool) []httpsFilterChainSpec {
+	if m == nil {
+		return nil
+	}
+
+	grouped := map[httpsFilterChainKey][]model.HTTPListener{}
+	for _, listener := range m.HTTP {
+		if len(listener.TLS) == 0 {
+			continue
+		}
+		if perPort && listener.Port != port {
+			continue
+		}
+		for _, secret := range listener.TLS {
+			key := httpsFilterChainKey{
+				secret:   secret,
+				hostname: listener.Hostname,
+				port:     listener.Port,
+			}
+			grouped[key] = append(grouped[key], listener)
+		}
+	}
+
+	keys := goslices.SortedStableFunc(maps.Keys(grouped), func(a, b httpsFilterChainKey) int {
+		if v := cmp.Compare(a.secret.Namespace+"/"+a.secret.Name, b.secret.Namespace+"/"+b.secret.Name); v != 0 {
+			return v
+		}
+		if v := cmp.Compare(a.port, b.port); v != 0 {
+			return v
+		}
+		return cmp.Compare(a.hostname, b.hostname)
+	})
+
+	specs := make([]httpsFilterChainSpec, 0, len(keys))
+	for _, key := range keys {
+		specs = append(specs, httpsFilterChainSpec{
+			secret:      key.secret,
+			hostnames:   []string{key.hostname},
+			filterModel: modelForHTTPSFilterChain(m, grouped[key]),
+		})
+	}
+	return specs
+}
+
+func modelForHTTPSFilterChain(m *model.Model, listeners []model.HTTPListener) *model.Model {
+	filtered := &model.Model{
+		HTTP: append([]model.HTTPListener(nil), listeners...),
+	}
+	if m == nil {
+		return filtered
+	}
+	filtered.HTTPOptions = m.HTTPOptions
+	filtered.Telemetry = m.Telemetry
+	if m.GatewayAuth == nil {
+		return filtered
+	}
+
+	referencedPolicies := map[string]struct{}{}
+	for _, listener := range listeners {
+		for _, route := range listener.Routes {
+			if route.GatewayAuthPolicy != "" {
+				referencedPolicies[route.GatewayAuthPolicy] = struct{}{}
+			}
+		}
+	}
+
+	if len(referencedPolicies) == 0 {
+		return filtered
+	}
+
+	policies := make([]model.GatewayAuthPolicy, 0, len(referencedPolicies))
+	for _, policy := range m.GatewayAuth.Policies {
+		key := fmt.Sprintf("%s/%s", policy.Source.Namespace, policy.Source.Name)
+		if _, ok := referencedPolicies[key]; ok {
+			policies = append(policies, policy)
+		}
+	}
+	if len(policies) > 0 {
+		filtered.GatewayAuth = &model.GatewayAuthModel{Policies: policies}
+	}
+	return filtered
 }
 
 func getHostNetworkListenerAddresses(ports []uint32, ipv4Enabled, ipv6Enabled bool) (*envoy_config_core_v3.Address, []*envoy_config_listener.AdditionalAddress) {

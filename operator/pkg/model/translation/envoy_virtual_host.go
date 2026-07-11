@@ -19,7 +19,6 @@ import (
 	extauthzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
 	jwtauthnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
 	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
-	oauth2v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/oauth2/v3"
 	rbacv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
 	envoy_type_matcher_v3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	envoy_type_v3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
@@ -283,16 +282,6 @@ func getTypedPerFilterConfig(m *model.Model, routeAuth *model.HTTPExternalAuthFi
 				Override: &luav3.LuaPerRoute_Disabled{Disabled: true},
 			})
 		}
-	}
-
-	for _, policy := range getGatewayOIDCPolicies(m) {
-		filterName := oidcFilterName(policy)
-		if activePolicy != nil && activePolicy.OIDC != nil &&
-			activePolicy.Source.Namespace == policy.Source.Namespace &&
-			activePolicy.Source.Name == policy.Source.Name {
-			continue
-		}
-		config[filterName] = toAny(&oauth2v3.OAuth2{})
 	}
 
 	if hasGatewayJWTAuth(m) {
