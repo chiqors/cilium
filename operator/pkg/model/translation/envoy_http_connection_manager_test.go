@@ -266,6 +266,8 @@ func Test_getHTTPConnectionManagerHttpFilters(t *testing.T) {
 		require.Equal(t, "client-id", oauth2Filter.GetConfig().GetCredentials().GetClientId())
 		require.Equal(t, "cilium-secrets/default-client-clientsecret", oauth2Filter.GetConfig().GetCredentials().GetTokenSecret().GetName())
 		require.Equal(t, "cilium-secrets/default-cookie-cookiesecret", oauth2Filter.GetConfig().GetCredentials().GetHmacSecret().GetName())
+		require.NotNil(t, oauth2Filter.GetConfig().GetCredentials().GetTokenSecret().GetSdsConfig())
+		require.NotNil(t, oauth2Filter.GetConfig().GetCredentials().GetHmacSecret().GetSdsConfig())
 		require.Equal(t, "https://issuer.example.com/token", oauth2Filter.GetConfig().GetTokenEndpoint().GetUri())
 	})
 }

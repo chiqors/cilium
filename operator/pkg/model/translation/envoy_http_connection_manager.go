@@ -24,6 +24,7 @@ import (
 	httpConnectionManagerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoy_config_tls_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	envoy_type_matcher_v3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -662,11 +663,13 @@ func (i *cecTranslator) buildOIDCHTTPFilter(policy model.GatewayAuthPolicy) *htt
 			Credentials: &oauth2v3.OAuth2Credentials{
 				ClientId: policy.OIDC.ClientID,
 				TokenSecret: &envoy_config_tls_v3.SdsSecretConfig{
-					Name: gatewayAuthSDSSecretName(i.Config.SecretsNamespace, policy.Source.Namespace, policy.OIDC.ClientSecret.Name, policy.OIDC.ClientSecret.Key),
+					Name:      gatewayAuthSDSSecretName(i.Config.SecretsNamespace, policy.Source.Namespace, policy.OIDC.ClientSecret.Name, policy.OIDC.ClientSecret.Key),
+					SdsConfig: proto.Clone(envoy.CiliumXdsWithAdsConfigSource).(*envoy_config_core.ConfigSource),
 				},
 				TokenFormation: &oauth2v3.OAuth2Credentials_HmacSecret{
 					HmacSecret: &envoy_config_tls_v3.SdsSecretConfig{
-						Name: gatewayAuthSDSSecretName(i.Config.SecretsNamespace, policy.Source.Namespace, policy.OIDC.CookieSecret.Name, policy.OIDC.CookieSecret.Key),
+						Name:      gatewayAuthSDSSecretName(i.Config.SecretsNamespace, policy.Source.Namespace, policy.OIDC.CookieSecret.Name, policy.OIDC.CookieSecret.Key),
+						SdsConfig: proto.Clone(envoy.CiliumXdsWithAdsConfigSource).(*envoy_config_core.ConfigSource),
 					},
 				},
 			},
