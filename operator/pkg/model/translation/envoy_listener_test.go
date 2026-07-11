@@ -1013,3 +1013,70 @@ func TestDesiredEnvoyListenerSingleHTTPSHostScopedOIDC(t *testing.T) {
 	require.NotContains(t, filterNamesByHost["open.example.com"], oidcFilterName(m.GatewayAuth.Policies[0]))
 	require.Contains(t, filterNamesByHost["protected.example.com"], oidcFilterName(m.GatewayAuth.Policies[0]))
 }
+
+func TestDesiredEnvoyListenerWildcardHTTPSHostScopedOIDC(t *testing.T) {
+	i := &cecTranslator{
+		Config: Config{
+			SecretsNamespace: "cilium-secrets",
+		},
+	}
+
+	m := &model.Model{
+		HTTP: []model.HTTPListener{{
+			Port:     443,
+			Hostname: "*",
+			TLS:      []model.TLSSecret{{Name: "shared-cert", Namespace: "default"}},
+			Routes: []model.HTTPRoute{
+				{
+					Hostnames: []string{"open.example.com"},
+					PathMatch: model.StringMatch{Prefix: "/"},
+					Backends:  []model.Backend{{Name: "open-svc", Namespace: "default", Port: &model.BackendPort{Port: 80}}},
+				},
+				{
+					Hostnames:         []string{"protected.example.com"},
+					PathMatch:         model.StringMatch{Prefix: "/"},
+					GatewayAuthPolicy: "default/oidc",
+					Backends:          []model.Backend{{Name: "protected-svc", Namespace: "default", Port: &model.BackendPort{Port: 80}}},
+				},
+			},
+		}},
+		GatewayAuth: &model.GatewayAuthModel{
+			Policies: []model.GatewayAuthPolicy{{
+				Source: model.FullyQualifiedResource{Name: "oidc", Namespace: "default"},
+				OIDC: &model.GatewayOIDCAuth{
+					ClientID:     "client-id",
+					ClientSecret: model.GatewayAuthSecretRef{Name: "oidc-secret", Key: "clientSecret", Found: true},
+					CookieSecret: model.GatewayAuthSecretRef{Name: "oidc-secret", Key: "cookieSecret", Found: true},
+					Endpoints: &model.GatewayOIDCEndpoints{
+						Authorization: "https://issuer.example.com/authorize",
+						Token:         "https://issuer.example.com/token",
+					},
+				},
+			}},
+		},
+	}
+
+	res, err := i.desiredEnvoyListener(m)
+	require.NoError(t, err)
+	require.Len(t, res, 1)
+
+	l := &envoy_config_listener.Listener{}
+	require.NoError(t, proto.Unmarshal(res[0].Value, l))
+	require.Len(t, l.FilterChains, 2)
+
+	filterNamesByHost := map[string][]string{}
+	for _, fc := range l.FilterChains {
+		hcm := &envoy_extensions_filters_network_hcm_v3.HttpConnectionManager{}
+		require.NoError(t, proto.Unmarshal(fc.Filters[0].GetTypedConfig().GetValue(), hcm))
+		require.Len(t, fc.FilterChainMatch.ServerNames, 1)
+
+		names := make([]string, 0, len(hcm.HttpFilters))
+		for _, filter := range hcm.HttpFilters {
+			names = append(names, filter.Name)
+		}
+		filterNamesByHost[fc.FilterChainMatch.ServerNames[0]] = names
+	}
+
+	require.NotContains(t, filterNamesByHost["open.example.com"], oidcFilterName(m.GatewayAuth.Policies[0]))
+	require.Contains(t, filterNamesByHost["protected.example.com"], oidcFilterName(m.GatewayAuth.Policies[0]))
+}

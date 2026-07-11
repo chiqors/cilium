@@ -607,13 +607,15 @@ func httpsFilterChainSpecs(m *model.Model, port uint32, perPort bool) []httpsFil
 		if perPort && listener.Port != port {
 			continue
 		}
-		for _, secret := range listener.TLS {
-			key := httpsFilterChainKey{
-				secret:   secret,
-				hostname: listener.Hostname,
-				port:     listener.Port,
+		for _, splitListener := range splitHTTPSListenerByHostname(listener) {
+			for _, secret := range splitListener.TLS {
+				key := httpsFilterChainKey{
+					secret:   secret,
+					hostname: splitListener.Hostname,
+					port:     splitListener.Port,
+				}
+				grouped[key] = append(grouped[key], splitListener)
 			}
-			grouped[key] = append(grouped[key], listener)
 		}
 	}
 
@@ -636,6 +638,70 @@ func httpsFilterChainSpecs(m *model.Model, port uint32, perPort bool) []httpsFil
 		})
 	}
 	return specs
+}
+
+func splitHTTPSListenerByHostname(listener model.HTTPListener) []model.HTTPListener {
+	if listener.Hostname != "" && listener.Hostname != "*" {
+		return []model.HTTPListener{listener}
+	}
+
+	hostnames := map[string]struct{}{}
+	for _, route := range listener.Routes {
+		if len(route.Hostnames) == 0 {
+			continue
+		}
+		for _, hostname := range route.Hostnames {
+			hostnames[hostname] = struct{}{}
+		}
+	}
+
+	if len(hostnames) == 0 {
+		return []model.HTTPListener{listener}
+	}
+
+	keys := maps.Keys(hostnames)
+	goslices.Sort(keys)
+
+	result := make([]model.HTTPListener, 0, len(keys))
+	for _, hostname := range keys {
+		split := listener
+		split.Hostname = hostname
+		split.Routes = filterRoutesForHostname(listener.Routes, hostname)
+		if len(split.Routes) == 0 {
+			continue
+		}
+		result = append(result, split)
+	}
+
+	if len(result) == 0 {
+		return []model.HTTPListener{listener}
+	}
+	return result
+}
+
+func filterRoutesForHostname(routes []model.HTTPRoute, hostname string) []model.HTTPRoute {
+	filtered := make([]model.HTTPRoute, 0, len(routes))
+	for _, route := range routes {
+		if len(route.Hostnames) == 0 {
+			filtered = append(filtered, route)
+			continue
+		}
+
+		matchedHostnames := make([]string, 0, len(route.Hostnames))
+		for _, routeHostname := range route.Hostnames {
+			if routeHostname == hostname {
+				matchedHostnames = append(matchedHostnames, routeHostname)
+			}
+		}
+		if len(matchedHostnames) == 0 {
+			continue
+		}
+
+		routeCopy := route
+		routeCopy.Hostnames = matchedHostnames
+		filtered = append(filtered, routeCopy)
+	}
+	return filtered
 }
 
 func modelForHTTPSFilterChain(m *model.Model, listeners []model.HTTPListener) *model.Model {
